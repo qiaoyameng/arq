@@ -41,8 +41,8 @@ async def main():
     >  JobStatus.queued
     """
 
-    # poll redis for the job result, if the job raised an exception,
-    # it will be raised here
+    # wait for the job result (via a redis pub/sub notification); if the job
+    # raised an exception, it will be raised here
     # (You'll need the worker running at the same time to get a result here)
     print(await job.result(timeout=5))
     """

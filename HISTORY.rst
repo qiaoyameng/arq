@@ -3,6 +3,22 @@
 History
 -------
 
+v0.29.0 (unreleased)
+....................
+
+* ``Job.result`` waits for results via redis pub/sub notifications instead of
+  polling: the worker publishes a per-job wake-up ping in the same transaction
+  that persists the result. Waiters share one subscription per job, cancelling
+  one waiter never unsubscribes the others, state is re-checked after
+  subscribing and after every wake-up (so a lost notification cannot hang a
+  waiter), and a dropped notification connection is rebuilt with all channels
+  re-subscribed. Results are still persisted with TTL - notifications are only
+  a wake-up signal.
+* Add ``ResultExpired`` (subclass of ``ResultNotFound``) for a job that was
+  observed as queued/running but finished without a retrievable result (result
+  key expired or the job was configured not to keep one), distinguishing it
+  from a job that never existed.
+
 v0.28.0 (2026-04-16)
 ....................
 

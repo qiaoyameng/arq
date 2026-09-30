@@ -26,6 +26,7 @@ from .constants import (
     in_progress_key_prefix,
     job_key_prefix,
     keep_cronjob_progress,
+    result_channel_prefix,
     result_key_prefix,
     retry_key_prefix,
 )
@@ -701,6 +702,10 @@ class Worker:
                 if result_data:
                     expire = None if keep_result_forever else result_timeout_s
                     tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))
+                # wake notification-waiting clients in the same transaction that
+                # persists the result (or decides there is none); the message is
+                # only a ping, waiters always re-read the persisted state
+                tr.publish(result_channel_prefix + job_id, job_id)
                 delete_keys += [retry_key_prefix + job_id, job_key_prefix + job_id]
                 tr.zrem(abort_jobs_ss, job_id)
                 tr.zrem(self.queue_name, job_id)
@@ -724,6 +729,7 @@ class Worker:
             if result_data is not None and keep_result:  # pragma: no branch
                 expire = 0 if self.keep_result_forever else self.keep_result_s
                 tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))
+            tr.publish(result_channel_prefix + job_id, job_id)
             await tr.execute()
 
     async def heart_beat(self) -> None:

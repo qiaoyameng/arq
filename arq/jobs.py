@@ -10,7 +10,7 @@ from typing import Any, Callable, Optional
 from redis.asyncio import Redis
 
 from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
-from .utils import ms_to_datetime, poll, timestamp_ms
+from .utils import ms_to_datetime, timestamp_ms
 
 logger = logging.getLogger('arq.jobs')
 
@@ -20,6 +20,17 @@ Deserializer = Callable[[bytes], dict[str, Any]]
 
 class ResultNotFound(RuntimeError):
     pass
+
+
+class ResultExpired(ResultNotFound):
+    """
+    The job used to exist (was queued or running while we waited) but its result
+    key has expired and no more state is available, so the result can never be
+    returned.
+
+    Subclasses :class:`ResultNotFound` so existing callers keep working; use the
+    subclass to tell expiry apart from a job that never existed.
+    """
 
 
 class JobStatus(str, Enum):
@@ -88,11 +99,25 @@ class Job:
         """
         Get the result of the job or, if the job raised an exception, reraise it.
 
-        This function waits for the result if it's not yet available and the job is
-        present in the queue. Otherwise ``ResultNotFound`` is raised.
+        This function waits for the result if it's not yet available and the
+        job is present. Waiting is notification based: the worker publishes a
+        wake-up ping on a per-job channel in the same transaction that persists
+        the result, and many waiters share a single pub/sub subscription. State
+        is always re-read from redis after subscribing and after every wake-up,
+        so a notification that is lost (e.g. the notification connection drops)
+        or races with the subscription cannot cause a hang.
+
+        If the job never existed (and is not currently in the queue)
+        :class:`ResultNotFound` is raised. If a job that was present while we
+        waited finishes without a retrievable result (its result key already
+        expired, or the job was configured not to keep one) :class:`ResultExpired`
+        is raised instead. ``ResultExpired`` is a subclass of ``ResultNotFound``.
+
+        Clients that are not an :class:`~arq.connections.ArqRedis` fall back to
+        polling every ``poll_delay`` seconds.
 
         :param timeout: maximum time to wait for the job result before raising ``TimeoutError``, will wait forever
-        :param poll_delay: how often to poll redis for the job result
+        :param poll_delay: polling interval used only when notification based waiting is unavailable
         :param pole_delay: deprecated, use poll_delay instead
         """
         if pole_delay is not None:
@@ -101,12 +126,15 @@ class Job:
             )
             poll_delay = pole_delay
 
-        async for delay in poll(poll_delay):
-            async with self._redis.pipeline(transaction=True) as tr:
-                tr.get(result_key_prefix + self.job_id)
-                tr.zscore(self._queue_name, self.job_id)
-                v, s = await tr.execute()
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        # whether we have personally observed the job as queued/running: that is
+        # what lets us distinguish "expired / result not kept" from "never existed"
+        seen_present = False
 
+        notifier = getattr(self._redis, 'result_notifier', None)
+
+        while True:
+            v, score = await self._fetch_state()
             if v:
                 info = deserialize_result(v, deserializer=self._deserializer)
                 if info.success:
@@ -115,14 +143,54 @@ class Job:
                     raise info.result
                 else:
                     raise SerializationError(info.result)
-            elif s is None:
+            if score is not None:
+                seen_present = True
+            elif seen_present:
+                raise ResultExpired(
+                    'Job result is not available: the job finished but its result was not kept '
+                    'or has already expired.'
+                )
+            else:
                 raise ResultNotFound(
                     'Not waiting for job result because the job is not in queue. '
                     'Is the worker function configured to keep result?'
                 )
 
-            if timeout is not None and delay > timeout:
+            remaining = None if deadline is None else deadline - asyncio.get_running_loop().time()
+            if remaining is not None and remaining <= 0:
                 raise asyncio.TimeoutError()
+
+            if notifier is None:
+                await asyncio.sleep(min(poll_delay, remaining) if remaining is not None else poll_delay)
+                continue
+
+            # a fresh waiter per iteration: a disconnect-induced wake-up
+            # resolves the old future, and looping back must register a new one
+            # (shared with any other waiters) rather than sleeping on an
+            # already-resolved future
+            waiter = notifier.wait_for(self.job_id)
+            try:
+                await waiter.subscribe()
+                # mandatory re-check between the SUBSCRIBE being confirmed and
+                # going to sleep; the waiter was registered before the
+                # SUBSCRIBE, so a completion landing in this gap is caught
+                # either here or by the notification waking the registered future
+                v, score = await self._fetch_state()
+                if v is not None or score is None:
+                    continue
+                seen_present = True
+                woken = await waiter.wait(remaining)
+                if not woken:
+                    raise asyncio.TimeoutError()
+            finally:
+                await waiter.release()
+
+    async def _fetch_state(self) -> tuple[Optional[bytes], Optional[float]]:
+        async with self._redis.pipeline(transaction=True) as tr:
+            tr.get(result_key_prefix + self.job_id)
+            tr.zscore(self._queue_name, self.job_id)
+            v, score = await tr.execute()
+        return v, score
 
     async def info(self) -> Optional[JobDef]:
         """

@@ -15,6 +15,7 @@ from redis.exceptions import RedisError, WatchError
 
 from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
 from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
+from .notifier import ResultNotifier
 from .utils import timestamp_ms, to_ms, to_unix_ms
 
 logger = logging.getLogger('arq.connections')
@@ -114,7 +115,24 @@ class ArqRedis(BaseRedis):
         if pool_or_conn:
             kwargs['connection_pool'] = pool_or_conn
         self.expires_extra_ms = expires_extra_ms
+        self._result_notifier: Optional[ResultNotifier] = None
         super().__init__(**kwargs)
+
+    @property
+    def result_notifier(self) -> ResultNotifier:
+        """
+        Lazily created, shared :class:`~arq.notifier.ResultNotifier` used by
+        :meth:`arq.jobs.Job.result` to wait for notifications instead of polling.
+        """
+        if self._result_notifier is None:
+            self._result_notifier = ResultNotifier(self)
+        return self._result_notifier
+
+    async def aclose(self, *, close_connection_pool: Optional[bool] = None) -> None:
+        notifier = self._result_notifier
+        if notifier is not None:
+            await notifier.aclose()
+        await super().aclose(close_connection_pool=close_connection_pool)
 
     async def enqueue_job(
         self,
