@@ -14,7 +14,16 @@ from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import RedisError, WatchError
 
 from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
-from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
+from .jobs import (
+    Deserializer,
+    Job,
+    JobDef,
+    JobResult,
+    ResultNotifications,
+    Serializer,
+    deserialize_job,
+    serialize_job,
+)
 from .utils import timestamp_ms, to_ms, to_unix_ms
 
 logger = logging.getLogger('arq.connections')
@@ -114,7 +123,14 @@ class ArqRedis(BaseRedis):
         if pool_or_conn:
             kwargs['connection_pool'] = pool_or_conn
         self.expires_extra_ms = expires_extra_ms
+        self._arq_result_notifications = ResultNotifications(self)
         super().__init__(**kwargs)
+
+    async def aclose(self, close_connection_pool: Optional[bool] = None) -> None:
+        notifications = self.__dict__.pop('_arq_result_notifications', None)
+        if notifications is not None:
+            await notifications.aclose()
+        await super().aclose(close_connection_pool)
 
     async def enqueue_job(
         self,

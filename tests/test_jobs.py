@@ -6,12 +6,19 @@ from dirty_equals import IsNow, IsStr
 
 from arq import Worker, func
 from arq.connections import ArqRedis, RedisSettings, create_pool
-from arq.constants import default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from arq.constants import (
+    default_queue_name,
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+    result_notification_channel_prefix,
+)
 from arq.jobs import (
     DeserializationError,
     Job,
     JobResult,
     JobStatus,
+    ResultExpired,
     ResultNotFound,
     deserialize_job_raw,
     serialize_result,
@@ -42,6 +49,163 @@ async def test_result_not_found(arq_redis: ArqRedis):
     j = Job('foobar', arq_redis)
     with pytest.raises(ResultNotFound):
         await j.result()
+
+
+async def test_result_completes_before_subscription(arq_redis: ArqRedis, worker, monkeypatch):
+    async def foobar(ctx):
+        return 42
+
+    worker: Worker = worker(functions=[func(foobar, name='foobar')])
+    j = await arq_redis.enqueue_job('foobar')
+    notifications = arq_redis._arq_result_notifications
+    pubsub_factory = arq_redis.pubsub
+    subscription_sent = asyncio.Event()
+    allow_subscription_ack = asyncio.Event()
+
+    class ControlledPubSub:
+        def __new__(cls, *args, **kwargs):
+            pubsub = pubsub_factory(*args, **kwargs)
+            get_message = pubsub.get_message
+
+            async def controlled_get_message(*message_args, **message_kwargs):
+                message = await get_message(*message_args, **message_kwargs)
+                if message is not None and message['type'] == 'psubscribe':
+                    subscription_sent.set()
+                    await allow_subscription_ack.wait()
+                return message
+
+            pubsub.get_message = controlled_get_message
+            return pubsub
+
+    monkeypatch.setattr(arq_redis, 'pubsub', ControlledPubSub)
+    result = asyncio.create_task(j.result(poll_delay=0.01))
+    await subscription_sent.wait()
+
+    await worker.main()
+    allow_subscription_ack.set()
+
+    assert await asyncio.wait_for(result, timeout=5) == 42
+
+
+async def test_result_completes_between_subscription_and_recheck(arq_redis: ArqRedis, worker, monkeypatch):
+    async def foobar(ctx):
+        return 42
+
+    worker: Worker = worker(functions=[func(foobar, name='foobar')])
+    j = await arq_redis.enqueue_job('foobar')
+    result_state = j._result_state
+    subscription_confirmed = asyncio.Event()
+    allow_recheck = asyncio.Event()
+    state_calls = 0
+
+    async def controlled_result_state():
+        nonlocal state_calls
+        state_calls += 1
+        if state_calls == 2:
+            subscription_confirmed.set()
+            await allow_recheck.wait()
+        return await result_state()
+
+    monkeypatch.setattr(j, '_result_state', controlled_result_state)
+    result = asyncio.create_task(j.result(poll_delay=0.01))
+    await subscription_confirmed.wait()
+
+    await worker.main()
+    allow_recheck.set()
+
+    assert await asyncio.wait_for(result, timeout=5) == 42
+
+
+async def test_result_completes_after_recheck_uses_notification(arq_redis: ArqRedis, worker, monkeypatch):
+    async def foobar(ctx):
+        return 42
+
+    worker: Worker = worker(functions=[func(foobar, name='foobar')])
+    j = await arq_redis.enqueue_job('foobar')
+    notifications = arq_redis._arq_result_notifications
+    subscribe = notifications.subscribe
+    subscribed = asyncio.Event()
+
+    async def subscribed_subscribe(job_id, queue_name):
+        waiter = await subscribe(job_id)
+        subscribed.set()
+        return waiter
+
+    monkeypatch.setattr(notifications, 'subscribe', subscribed_subscribe)
+    result = asyncio.create_task(j.result(poll_delay=10))
+    await subscribed.wait()
+    while j.job_id not in notifications._waiters:
+        await asyncio.sleep(0.01)
+
+    await worker.main()
+
+    assert await asyncio.wait_for(result, timeout=5) == 42
+
+
+async def test_result_rechecks_after_notification_disconnect(arq_redis: ArqRedis, worker, monkeypatch):
+    async def foobar(ctx):
+        return 42
+
+    worker: Worker = worker(functions=[func(foobar, name='foobar')])
+    j = await arq_redis.enqueue_job('foobar')
+    notifications = arq_redis._arq_result_notifications
+    subscribe = notifications.subscribe
+    subscribed = asyncio.Event()
+
+    async def subscribed_subscribe(job_id, queue_name):
+        waiter = await subscribe(job_id)
+        subscribed.set()
+        return waiter
+
+    monkeypatch.setattr(notifications, 'subscribe', subscribed_subscribe)
+    result = asyncio.create_task(j.result(poll_delay=0.01))
+    await subscribed.wait()
+
+    notifications._pubsub.connection.disconnect()
+    await worker.main()
+
+    assert await asyncio.wait_for(result, timeout=5) == 42
+
+
+async def test_result_waiters_share_subscription_and_cancel_independently(arq_redis: ArqRedis, worker):
+    async def foobar(ctx):
+        return 42
+
+    worker: Worker = worker(functions=[func(foobar, name='foobar')])
+    j = await arq_redis.enqueue_job('foobar')
+    notifications = arq_redis._arq_result_notifications
+    first_result = asyncio.create_task(j.result(poll_delay=10))
+    second_result = asyncio.create_task(j.result(poll_delay=10))
+
+    while len(notifications._waiters[j.job_id]) < 2:
+        await asyncio.sleep(0.01)
+
+    pubsub = notifications._pubsub
+    first_result.cancel()
+    cancelled = await asyncio.gather(first_result, return_exceptions=True)
+    assert isinstance(cancelled[0], asyncio.CancelledError)
+    assert len(notifications._waiters[j.job_id]) == 1
+
+    await worker.main()
+
+    assert await asyncio.wait_for(second_result, timeout=5) == 42
+    assert notifications._pubsub is pubsub
+
+
+async def test_result_expired_is_distinct_from_unknown_job(arq_redis: ArqRedis):
+    job_id = 'previously-known-job'
+    j = Job(job_id, arq_redis)
+    await arq_redis.zadd(default_queue_name, {job_id: 1})
+
+    result = asyncio.create_task(j.result(timeout=2, poll_delay=0.01))
+    while not arq_redis._arq_result_notifications._waiters.get(job_id):
+        await asyncio.sleep(0.01)
+
+    await arq_redis.zrem(default_queue_name, job_id)
+    await arq_redis.publish(result_notification_channel_prefix + job_id, b'')
+
+    with pytest.raises(ResultExpired):
+        await result
 
 
 async def test_result_when_job_does_not_keep_result(arq_redis: ArqRedis, worker):

@@ -27,6 +27,7 @@ from .constants import (
     job_key_prefix,
     keep_cronjob_progress,
     result_key_prefix,
+    result_notification_channel_prefix,
     retry_key_prefix,
 )
 from .utils import (
@@ -704,6 +705,7 @@ class Worker:
                 delete_keys += [retry_key_prefix + job_id, job_key_prefix + job_id]
                 tr.zrem(abort_jobs_ss, job_id)
                 tr.zrem(self.queue_name, job_id)
+                tr.publish(result_notification_channel_prefix + job_id, b'result' if result_data else b'none')
             elif incr_score:
                 tr.zincrby(self.queue_name, incr_score, job_id)
             if delete_keys:
@@ -724,6 +726,7 @@ class Worker:
             if result_data is not None and keep_result:  # pragma: no branch
                 expire = 0 if self.keep_result_forever else self.keep_result_s
                 tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))
+            tr.publish(result_notification_channel_prefix + job_id, b'result' if result_data else b'none')
             await tr.execute()
 
     async def heart_beat(self) -> None:

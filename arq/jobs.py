@@ -2,15 +2,27 @@ import asyncio
 import logging
 import pickle
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from redis.exceptions import RedisError
 from redis.asyncio import Redis
 
-from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
-from .utils import ms_to_datetime, poll, timestamp_ms
+from .constants import (
+    abort_jobs_ss,
+    default_queue_name,
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+    result_notification_channel_prefix,
+)
+from .utils import ms_to_datetime, timestamp_ms
+
+if TYPE_CHECKING:
+    from redis.asyncio.client import PubSub
 
 logger = logging.getLogger('arq.jobs')
 
@@ -20,6 +32,13 @@ Deserializer = Callable[[bytes], dict[str, Any]]
 
 class ResultNotFound(RuntimeError):
     pass
+
+
+class ResultExpired(ResultNotFound):
+    pass
+
+
+ResultExpiredError = ResultExpired
 
 
 class JobStatus(str, Enum):
@@ -63,6 +82,163 @@ class JobResult(JobDef):
     queue_name: str
 
 
+@dataclass
+class _JobResultState:
+    result: Optional[bytes]
+    score: Optional[float]
+    in_progress: bool
+
+
+_result_pending = object()
+
+
+class ResultNotifications:
+    def __init__(self, redis: 'Redis[bytes]', reconnect_delay: float = 0.5):
+        self._redis = redis
+        self._reconnect_delay = reconnect_delay
+        self._pubsub: Optional['PubSub'] = None
+        self._reader: Optional[asyncio.Task[None]] = None
+        self._startup: Optional[asyncio.Future[bool]] = None
+        self._lock = asyncio.Lock()
+        self._waiters: dict[str, set['asyncio.Queue[bytes]']] = defaultdict(set)
+        self._queue_names: dict[str, str] = {}
+
+    async def _create_reader(self) -> None:
+        pubsub = self._redis.pubsub()
+        task = asyncio.get_running_loop().create_task(self._read(pubsub))
+        startup: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        self._pubsub = pubsub
+        self._reader = task
+        self._startup = startup
+
+        try:
+            await pubsub.psubscribe(result_notification_channel_prefix + '*')
+            if pubsub.connection is not None:
+                pubsub.connection.health_check_interval = self._reconnect_delay
+            await asyncio.wait_for(startup, timeout=5)
+        except BaseException:
+            self._pubsub = None
+            self._reader = None
+            self._startup = None
+            task.cancel()
+            try:
+                await task
+            except BaseException:
+                pass
+            await pubsub.aclose()
+            raise
+
+    async def subscribe(self, job_id: str, queue_name: str) -> '_ResultWaiter':
+        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=1)
+        async with self._lock:
+            self._waiters[job_id].add(queue)
+            self._queue_names[job_id] = queue_name
+            try:
+                if self._reader is None or self._reader.done():
+                    await self._create_reader()
+            except BaseException:
+                self._unsubscribe(job_id, queue)
+                raise
+        return _ResultWaiter(self, job_id, queue)
+
+    def _unsubscribe(self, job_id: str, queue: 'asyncio.Queue[bytes]') -> None:
+        waiters = self._waiters.get(job_id)
+        if waiters is not None:
+            waiters.discard(queue)
+            if not waiters:
+                self._waiters.pop(job_id, None)
+                self._queue_names.pop(job_id, None)
+
+    def _wake(self, job_id: Optional[str] = None, data: bytes = b'') -> None:
+        if job_id is None:
+            waiters = [queue for queues in self._waiters.values() for queue in queues]
+        else:
+            waiters = list(self._waiters.get(job_id, ()))
+
+        for queue in waiters:
+            if queue.empty():
+                queue.put_nowait(data)
+
+    async def _recheck_waiting_jobs(self) -> None:
+        jobs = list(self._waiters)
+        if not jobs:
+            return
+
+        async with self._redis.pipeline(transaction=True) as pipe:
+            for job_id in jobs:
+                queue_name = self._queue_names.get(job_id, default_queue_name)
+                pipe.get(result_key_prefix + job_id)
+                pipe.zscore(queue_name, job_id)
+                pipe.exists(in_progress_key_prefix + job_id)
+            values = await pipe.execute()
+
+        for index, job_id in enumerate(jobs):
+            result, score, in_progress = values[index * 3 : index * 3 + 3]
+            if result or (score is None and not in_progress):
+                self._wake(job_id)
+
+    async def _read(self, pubsub: 'PubSub') -> None:
+        pattern = result_notification_channel_prefix.encode()
+        while True:
+            try:
+                message = await pubsub.get_message(ignore_subscribe_messages=False, timeout=self._reconnect_delay)
+                if message is None:
+                    await self._recheck_waiting_jobs()
+                    continue
+
+                message_type = message['type']
+                if message_type in {'psubscribe', 'pmessage'}:
+                    if message_type == 'psubscribe' and self._startup is not None and not self._startup.done():
+                        self._startup.set_result(True)
+                    elif message_type == 'psubscribe':
+                        self._wake()
+                    if message_type == 'pmessage':
+                        channel = message['channel']
+                        data = message['data']
+                        if isinstance(channel, bytes) and channel.startswith(pattern):
+                            data = data if isinstance(data, bytes) else b''
+                            self._wake(channel[len(pattern) :].decode(), data)
+                        elif isinstance(channel, str) and channel.startswith(result_notification_channel_prefix):
+                            data = data if isinstance(data, bytes) else b''
+                            self._wake(channel[len(result_notification_channel_prefix) :], data)
+                elif message['type'] != 'pong':
+                    self._wake()
+            except asyncio.CancelledError:
+                raise
+            except BaseException:
+                self._wake()
+                await asyncio.sleep(self._reconnect_delay)
+
+    async def aclose(self) -> None:
+        if self._reader is not None:
+            self._reader.cancel()
+            try:
+                await self._reader
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._pubsub is not None:
+            await self._pubsub.aclose()
+        self._reader = None
+        self._pubsub = None
+        self._startup = None
+        self._wake()
+
+
+class _ResultWaiter:
+    __slots__ = '_notifications', '_job_id', '_queue'
+
+    def __init__(self, notifications: ResultNotifications, job_id: str, queue: 'asyncio.Queue[bytes]') -> None:
+        self._notifications = notifications
+        self._job_id = job_id
+        self._queue = queue
+
+    async def wait(self, timeout: Optional[float] = None) -> bytes:
+        return await asyncio.wait_for(self._queue.get(), timeout=timeout)
+
+    def close(self) -> None:
+        self._notifications._unsubscribe(self._job_id, self._queue)
+
+
 class Job:
     """
     Holds data a reference to a job.
@@ -83,7 +259,11 @@ class Job:
         self._deserializer = _deserializer
 
     async def result(
-        self, timeout: Optional[float] = None, *, poll_delay: float = 0.5, pole_delay: Optional[float] = None
+        self,
+        timeout: Optional[float] = None,
+        *,
+        poll_delay: float = 0.5,
+        pole_delay: Optional[float] = None,
     ) -> Any:
         """
         Get the result of the job or, if the job raised an exception, reraise it.
@@ -91,8 +271,12 @@ class Job:
         This function waits for the result if it's not yet available and the job is
         present in the queue. Otherwise ``ResultNotFound`` is raised.
 
+        Waiting is event-driven: waiters share a Redis Pub/Sub connection, and the
+        result is rechecked before and after establishing the subscription. Pub/Sub
+        messages only wake a waiter; the persisted result remains the source of truth.
+
         :param timeout: maximum time to wait for the job result before raising ``TimeoutError``, will wait forever
-        :param poll_delay: how often to poll redis for the job result
+        :param poll_delay: fallback delay when the notification connection is unavailable
         :param pole_delay: deprecated, use poll_delay instead
         """
         if pole_delay is not None:
@@ -101,28 +285,96 @@ class Job:
             )
             poll_delay = pole_delay
 
-        async for delay in poll(poll_delay):
-            async with self._redis.pipeline(transaction=True) as tr:
-                tr.get(result_key_prefix + self.job_id)
-                tr.zscore(self._queue_name, self.job_id)
-                v, s = await tr.execute()
+        deadline = None if timeout is None else asyncio.get_running_loop().time() + timeout
+        saw_job = False
+        notifications = getattr(self._redis, '_arq_result_notifications', None)
+        if notifications is None:
+            notifications = ResultNotifications(self._redis)
+            try:
+                setattr(self._redis, '_arq_result_notifications', notifications)
+            except (AttributeError, TypeError):
+                pass
 
-            if v:
-                info = deserialize_result(v, deserializer=self._deserializer)
-                if info.success:
-                    return info.result
-                elif isinstance(info.result, (Exception, asyncio.CancelledError)):
-                    raise info.result
-                else:
-                    raise SerializationError(info.result)
-            elif s is None:
+        while True:
+            state = await self._result_state()
+            result = self._deserialize_result_state(state)
+            if result is not _result_pending:
+                return result
+
+            if state.score is not None or state.in_progress:
+                saw_job = True
+            elif saw_job:
+                raise ResultExpired(
+                    'Job result expired before it was read. '
+                    'Increase keep_result or use keep_result_forever to retain it for longer.'
+                )
+            else:
                 raise ResultNotFound(
                     'Not waiting for job result because the job is not in queue. '
                     'Is the worker function configured to keep result?'
                 )
 
-            if timeout is not None and delay > timeout:
-                raise asyncio.TimeoutError()
+            if deadline is not None:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+            else:
+                remaining = None
+
+            try:
+                subscription = await notifications.subscribe(self.job_id, self._queue_name)
+            except (RedisError, OSError):
+                await asyncio.sleep(poll_delay)
+                continue
+
+            try:
+                state = await self._result_state()
+                result = self._deserialize_result_state(state)
+                if result is not _result_pending:
+                    return result
+
+                if state.score is None and not state.in_progress:
+                    if saw_job and notification != b'none':
+                        raise ResultExpired(
+                            'Job result expired before it was read. '
+                            'Increase keep_result or use keep_result_forever to retain it for longer.'
+                        )
+                    raise ResultNotFound(
+                        'Not waiting for job result because the job is not in queue. '
+                        'Is the worker function configured to keep result?'
+                    )
+
+                if deadline is not None:
+                    remaining = deadline - asyncio.get_running_loop().time()
+                    if remaining <= 0:
+                        raise asyncio.TimeoutError()
+
+                notification = await subscription.wait(remaining)
+            except asyncio.TimeoutError:
+                raise
+            except (RedisError, OSError):
+                await asyncio.sleep(poll_delay)
+            finally:
+                subscription.close()
+
+    async def _result_state(self) -> _JobResultState:
+        async with self._redis.pipeline(transaction=True) as tr:
+            tr.get(result_key_prefix + self.job_id)
+            tr.zscore(self._queue_name, self.job_id)
+            tr.exists(in_progress_key_prefix + self.job_id)
+            result, score, in_progress = await tr.execute()
+        return _JobResultState(result, score, bool(in_progress))
+
+    def _deserialize_result_state(self, state: _JobResultState) -> Any:
+        if not state.result:
+            return _result_pending
+
+        info = deserialize_result(state.result, deserializer=self._deserializer)
+        if info.success:
+            return info.result
+        if isinstance(info.result, (Exception, asyncio.CancelledError)):
+            raise info.result
+        raise SerializationError(info.result)
 
     async def info(self) -> Optional[JobDef]:
         """
