@@ -49,6 +49,7 @@ watch = ['watchfiles>=0.16']
 
 [project.scripts]
 arq = 'arq.cli:cli'
+arq-doctor = 'arq.doctor:doctor'
 
 [project.urls]
 Homepage = 'https://github.com/python-arq/arq'

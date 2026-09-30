@@ -201,6 +201,30 @@ Where the items have the following meaning:
 * ``j_ongoing`` the number of jobs currently being performed
 * ``j_retried`` the number of jobs retries run
 
+Maintenance report
+..................
+
+If a maintenance script has deleted keys manually, a queue can contain a job id whose job payload is missing,
+while orphaned payload or retry keys can also be left behind. ``arq-doctor`` scans arq keys using ``SCAN``/``ZSCAN``,
+so workers can keep running while a report is generated.
+
+By default the command only reports state::
+
+    arq-doctor --redis-url redis://localhost:6379/0
+
+It distinguishes confirmed orphans, normal deferred jobs, queued jobs, executing or retrying jobs, completed jobs,
+and jobs with insufficient consistent state. A bounded repair plan can be written without changing Redis::
+
+    arq-doctor --redis-url redis://localhost:6379/0 --plan /tmp/arq-plan.json --max-actions 100
+
+Applying the plan re-reads and validates payloads, retry counters, queue scores and execution leases.
+Jobs whose state changed are skipped, so an old report can never delete a job that started running later::
+
+    arq-doctor --redis-url redis://localhost:6379/0 --apply-plan /tmp/arq-plan.json
+
+Use one or more ``--queue`` options for non-default queue keys, and ``--no-discover-queues`` to limit scanning
+to exactly those queues.
+
 Cron Jobs
 .........
 
