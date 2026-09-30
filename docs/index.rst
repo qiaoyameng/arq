@@ -215,6 +215,19 @@ Note that ``second`` defaults to ``0`` so you don't in inadvertently run jobs ev
 defaults to ``123456`` so you don't inadvertently run jobs every microsecond and so *arq* avoids enqueuing jobs
 at the top of a second when the world is generally slightly busier.
 
+Completion-Based Intervals
+..........................
+
+Unlike cron jobs, :func:`arq.cron.interval` schedules each run from the time the previous execution reached a
+terminal state. Long executions therefore do not accumulate missed runs, and the next execution cannot overlap
+the previous one.
+
+Whether a terminal success, failure or cancellation schedules another run is configured with
+``run_after_success``, ``run_after_failure`` and ``run_after_cancellation``. The next run time is stored in
+Redis and recovered when workers restart. Multiple workers use the same schedule safely.
+
+.. literalinclude:: examples/interval.py
+
 Synchronous Jobs
 ................
 
@@ -256,7 +269,7 @@ Reference
    :members: func, Retry, Worker
 
 .. automodule:: arq.cron
-   :members: cron
+   :members: cron, interval
 
 .. automodule:: arq.jobs
    :members: JobStatus, Job

@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
 
 from redis.exceptions import ResponseError, WatchError
 
-from arq.cron import CronJob
+from arq.cron import CronJob, IntervalJob
 from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, deserialize_job_raw, serialize_result
 
 from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
@@ -24,6 +24,7 @@ from .constants import (
     expires_extra_ms,
     health_check_key_suffix,
     in_progress_key_prefix,
+    interval_jobs_zset_prefix,
     job_key_prefix,
     keep_cronjob_progress,
     result_key_prefix,
@@ -146,6 +147,7 @@ class Worker:
       result of :func:`arq.worker.func`.
     :param queue_name: queue name to get jobs from
     :param cron_jobs:  list of cron jobs to run, use :func:`arq.cron.cron` to create them
+    :param interval_jobs: list of completion-based interval jobs, use :func:`arq.cron.interval` to create them
     :param redis_settings: settings for creating a redis connection
     :param redis_pool: existing redis pool, generally None
     :param burst: whether to stop the worker once all jobs have been run
@@ -189,7 +191,8 @@ class Worker:
         functions: Sequence[Union[Function, 'WorkerCoroutine']] = (),
         *,
         queue_name: Optional[str] = default_queue_name,
-        cron_jobs: Optional[Sequence[CronJob]] = None,
+        cron_jobs: Optional[Sequence[Union[CronJob, IntervalJob]]] = None,
+        interval_jobs: Optional[Sequence[IntervalJob]] = None,
         redis_settings: Optional[RedisSettings] = None,
         redis_pool: Optional[ArqRedis] = None,
         burst: bool = False,
@@ -219,7 +222,9 @@ class Worker:
         timezone: Optional[timezone] = None,
         log_results: bool = True,
     ):
-        self.functions: dict[str, Union[Function, CronJob]] = {f.name: f for f in map(func, functions)}
+        self.functions: dict[str, Union[Function, CronJob, IntervalJob]] = {
+            f.name: f for f in map(func, functions)
+        }
         if queue_name is None:
             if redis_pool is not None:
                 queue_name = redis_pool.default_queue_name
@@ -227,11 +232,21 @@ class Worker:
                 raise ValueError('If queue_name is absent, redis_pool must be present.')
         self.queue_name = queue_name
         self.cron_jobs: list[CronJob] = []
+        self.interval_jobs: list[IntervalJob] = []
         if cron_jobs is not None:
             if not all(isinstance(cj, CronJob) for cj in cron_jobs):
                 raise RuntimeError('cron_jobs, must be instances of CronJob')
-            self.cron_jobs = list(cron_jobs)
-            self.functions.update({cj.name: cj for cj in self.cron_jobs})
+            self.interval_jobs = [job for job in cron_jobs if isinstance(job, IntervalJob)]
+            self.cron_jobs = [job for job in cron_jobs if not isinstance(job, IntervalJob)]
+        if interval_jobs is not None:
+            if not all(isinstance(job, IntervalJob) for job in interval_jobs):
+                raise RuntimeError('interval_jobs must be instances of IntervalJob')
+            self.interval_jobs.extend(interval_jobs)
+        if cron_jobs is not None or interval_jobs is not None:
+            schedule_ids = [self._interval_job_schedule_id(job) for job in self.interval_jobs]
+            if len(schedule_ids) != len(set(schedule_ids)):
+                raise RuntimeError('interval job names and job_ids must be unique')
+            self.functions.update({job.name: job for job in [*self.cron_jobs, *self.interval_jobs]})
         if len(self.functions) == 0:
             raise RuntimeError('at least one function or cron_job must be registered')
         self.burst = burst
@@ -361,6 +376,8 @@ class Worker:
         self.ctx['redis'] = self.pool
         if self.on_startup:
             await self.on_startup(self.ctx)
+
+        await self.initialize_interval_jobs()
 
         async for _ in poll(self.poll_delay_s):
             await self._poll_iteration()
@@ -492,7 +509,12 @@ class Worker:
         args: tuple[Any, ...] = ()
         kwargs: dict[Any, Any] = {}
 
-        async def job_failed(exc: BaseException) -> None:
+        async def job_failed(
+            exc: BaseException,
+            *,
+            interval_schedule_id: Optional[str] = None,
+            interval_next_run_ms: Optional[int] = None,
+        ) -> None:
             self.jobs_failed += 1
             result_data_ = serialize_result(
                 function=function_name,
@@ -509,7 +531,14 @@ class Worker:
                 queue_name=self.queue_name,
                 job_id=job_id,
             )
-            await asyncio.shield(self.finish_failed_job(job_id, result_data_))
+            await asyncio.shield(
+                self.finish_failed_job(
+                    job_id,
+                    result_data_,
+                    interval_schedule_id=interval_schedule_id,
+                    interval_next_run_ms=interval_next_run_ms,
+                )
+            )
 
         if not v:
             logger.warning('job %s expired', job_id)
@@ -523,21 +552,43 @@ class Worker:
             logger.exception('deserializing job %s failed', job_id)
             return await job_failed(e)
 
+        known_function = self.functions.get(function_name)
         if abort_job:
             t = (timestamp_ms() - enqueue_time_ms) / 1000
             logger.info('%6.2fs ⊘ %s:%s aborted before start', t, job_id, function_name)
-            return await job_failed(asyncio.CancelledError())
+            if isinstance(known_function, IntervalJob):
+                next_run_ms: Optional[int] = (
+                    timestamp_ms() + known_function.interval_ms
+                    if known_function.run_after_cancellation
+                    else -1
+                )
+                interval_schedule_id = self._interval_job_schedule_id(known_function)
+            else:
+                next_run_ms = None
+                interval_schedule_id = None
+            return await job_failed(
+                asyncio.CancelledError(),
+                interval_schedule_id=interval_schedule_id,
+                interval_next_run_ms=next_run_ms,
+            )
 
         try:
-            function: Union[Function, CronJob] = self.functions[function_name]
+            function: Union[Function, CronJob, IntervalJob] = self.functions[function_name]
         except KeyError:
             logger.warning('job %s, function %r not found', job_id, function_name)
             return await job_failed(JobExecutionFailed(f'function {function_name!r} not found'))
 
-        if hasattr(function, 'next_run'):
-            # cron_job
+        interval_schedule_id = None
+        if isinstance(function, IntervalJob):
+            interval_schedule_id = self._interval_job_schedule_id(function)
+
+        timeout_s = self.job_timeout_s if function.timeout_s is None else function.timeout_s
+        if isinstance(function, IntervalJob):
             ref = function_name
-            keep_in_progress: Optional[float] = keep_cronjob_progress
+            keep_in_progress: Optional[float] = None
+        elif isinstance(function, CronJob):
+            ref = function_name
+            keep_in_progress = keep_cronjob_progress
         else:
             ref = f'{job_id}:{function_name}'
             keep_in_progress = None
@@ -548,6 +599,13 @@ class Worker:
 
         max_tries = self.max_tries if function.max_tries is None else function.max_tries
         if job_try > max_tries:
+            finished_ms = timestamp_ms()
+            if isinstance(function, IntervalJob):
+                max_tries_next_run_ms: Optional[int] = (
+                    finished_ms + function.interval_ms if function.run_after_failure else -1
+                )
+            else:
+                max_tries_next_run_ms = None
             t = (timestamp_ms() - enqueue_time_ms) / 1000
             logger.warning('%6.2fs ! %s max retries %d exceeded', t, ref, max_tries)
             self.jobs_failed += 1
@@ -560,18 +618,24 @@ class Worker:
                 False,
                 JobExecutionFailed(f'max {max_tries} retries exceeded'),
                 start_ms,
-                timestamp_ms(),
+                finished_ms,
                 ref,
                 self.queue_name,
                 job_id=job_id,
                 serializer=self.job_serializer,
             )
-            return await asyncio.shield(self.finish_failed_job(job_id, result_data))
+            return await asyncio.shield(
+                self.finish_failed_job(
+                    job_id,
+                    result_data,
+                    interval_schedule_id=interval_schedule_id,
+                    interval_next_run_ms=max_tries_next_run_ms,
+                )
+            )
 
         result = no_result
         exc_extra = None
         finish = False
-        timeout_s = self.job_timeout_s if function.timeout_s is None else function.timeout_s
         incr_score: Optional[int] = None
         job_ctx = {
             'job_id': job_id,
@@ -586,6 +650,7 @@ class Worker:
 
         start_ms = timestamp_ms()
         success = False
+        interval_next_run_ms: Optional[int] = None
         try:
             s = args_to_string(args, kwargs)
             extra = f' try={job_try}' if job_try > 1 else ''
@@ -622,9 +687,22 @@ class Worker:
                 finish = True
                 self.aborting_tasks.remove(job_id)
                 self.jobs_failed += 1
+                if isinstance(function, IntervalJob):
+                    interval_next_run_ms = (
+                        finished_ms + function.interval_ms if function.run_after_cancellation else -1
+                    )
             elif self.retry_jobs and isinstance(e, (asyncio.CancelledError, RetryJob)):
                 logger.info('%6.2fs ↻ %s cancelled, will be run again', t, ref)
                 self.jobs_retried += 1
+            elif not self.retry_jobs and isinstance(e, asyncio.CancelledError):
+                logger.info('%6.2fs ⊘ %s cancelled', t, ref)
+                result = e
+                finish = True
+                self.jobs_failed += 1
+                if isinstance(function, IntervalJob):
+                    interval_next_run_ms = (
+                        finished_ms + function.interval_ms if function.run_after_cancellation else -1
+                    )
             else:
                 logger.exception(
                     '%6.2fs ! %s failed, %s: %s', t, ref, e.__class__.__name__, e, extra={'extra': exc_extra}
@@ -632,12 +710,16 @@ class Worker:
                 result = e
                 finish = True
                 self.jobs_failed += 1
+                if isinstance(function, IntervalJob):
+                    interval_next_run_ms = finished_ms + function.interval_ms if function.run_after_failure else -1
         else:
             success = True
             finished_ms = timestamp_ms()
             logger.info('%6.2fs ← %s ● %s', (finished_ms - start_ms) / 1000, ref, result_str)
             finish = True
             self.jobs_complete += 1
+            if isinstance(function, IntervalJob):
+                interval_next_run_ms = finished_ms + function.interval_ms if function.run_after_success else -1
 
         keep_result_forever = (
             self.keep_result_forever if function.keep_result_forever is None else function.keep_result_forever
@@ -673,6 +755,8 @@ class Worker:
                 keep_result_forever,
                 incr_score,
                 keep_in_progress,
+                interval_schedule_id,
+                interval_next_run_ms,
             )
         )
 
@@ -688,6 +772,8 @@ class Worker:
         keep_result_forever: bool,
         incr_score: Optional[int],
         keep_in_progress: Optional[float],
+        interval_schedule_id: Optional[str],
+        interval_next_run_ms: Optional[int],
     ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             delete_keys = []
@@ -698,6 +784,8 @@ class Worker:
                 tr.pexpire(in_progress_key, to_ms(keep_in_progress))
 
             if finish:
+                if interval_schedule_id is not None and interval_next_run_ms is not None:
+                    tr.zadd(self.interval_jobs_key, {interval_schedule_id: interval_next_run_ms})
                 if result_data:
                     expire = None if keep_result_forever else result_timeout_s
                     tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))
@@ -710,7 +798,14 @@ class Worker:
                 tr.delete(*delete_keys)
             await tr.execute()
 
-    async def finish_failed_job(self, job_id: str, result_data: Optional[bytes]) -> None:
+    async def finish_failed_job(
+        self,
+        job_id: str,
+        result_data: Optional[bytes],
+        *,
+        interval_schedule_id: Optional[str] = None,
+        interval_next_run_ms: Optional[int] = None,
+    ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             tr.delete(
                 retry_key_prefix + job_id,
@@ -719,6 +814,8 @@ class Worker:
             )
             tr.zrem(abort_jobs_ss, job_id)
             tr.zrem(self.queue_name, job_id)
+            if interval_schedule_id is not None and interval_next_run_ms is not None:
+                tr.zadd(self.interval_jobs_key, {interval_schedule_id: interval_next_run_ms})
             # result_data would only be None if serializing the result fails
             keep_result = self.keep_result_forever or self.keep_result_s > 0
             if result_data is not None and keep_result:  # pragma: no branch
@@ -732,6 +829,7 @@ class Worker:
 
         cron_window_size = max(self.poll_delay_s, 0.5)  # Clamp the cron delay to 0.5
         await self.run_cron(now, cron_window_size)
+        await self.run_intervals()
 
     async def run_cron(self, n: datetime, delay: float, num_windows: int = 2) -> None:
         job_futures = set()
@@ -767,6 +865,63 @@ class Worker:
                     )
                 )
                 cron_job.calculate_next(cron_job.next_run)
+
+        job_futures and await asyncio.gather(*job_futures)
+
+    @property
+    def interval_jobs_key(self) -> str:
+        return interval_jobs_zset_prefix + self.queue_name
+
+    def _interval_job_schedule_id(self, interval_job: IntervalJob) -> str:
+        return interval_job.job_id or interval_job.name
+
+    async def initialize_interval_jobs(self) -> None:
+        if not self.interval_jobs:
+            return
+
+        now_ms = timestamp_ms()
+        schedules = {
+            self._interval_job_schedule_id(interval_job): (
+                now_ms if interval_job.run_at_startup else now_ms + interval_job.interval_ms
+            )
+            for interval_job in self.interval_jobs
+        }
+        await self.pool.zadd(self.interval_jobs_key, schedules, nx=True)
+        await self.sync_interval_next_runs()
+
+    async def sync_interval_next_runs(self) -> None:
+        schedules = await self.pool.zrange(self.interval_jobs_key, start=0, end=-1, withscores=True)
+        next_runs = {member.decode(): int(score) for member, score in schedules}
+        for interval_job in self.interval_jobs:
+            next_run_ms = next_runs.get(self._interval_job_schedule_id(interval_job))
+            interval_job.next_run = None if next_run_ms is None or next_run_ms < 0 else ms_to_datetime(next_run_ms)
+
+    async def run_intervals(self) -> None:
+        now_ms = timestamp_ms()
+        schedules = await self.pool.zrangebyscore(
+            self.interval_jobs_key,
+            min=0,
+            max=now_ms,
+            withscores=True,
+        )
+        interval_jobs_by_schedule_id = {
+            self._interval_job_schedule_id(interval_job): interval_job for interval_job in self.interval_jobs
+        }
+        job_futures = set()
+        for schedule_id_b, score in schedules:
+            schedule_id = schedule_id_b.decode()
+            interval_job = interval_jobs_by_schedule_id.get(schedule_id)
+            if interval_job is None:
+                continue
+
+            scheduled_at_ms = int(score)
+            job_futures.add(
+                self.pool.enqueue_job(
+                    interval_job.name,
+                    _job_id=f'{schedule_id}:{scheduled_at_ms}',
+                    _queue_name=self.queue_name,
+                )
+            )
 
         job_futures and await asyncio.gather(*job_futures)
 
