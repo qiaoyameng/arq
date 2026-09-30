@@ -4,6 +4,8 @@ in_progress_key_prefix = 'arq:in-progress:'
 result_key_prefix = 'arq:result:'
 retry_key_prefix = 'arq:retry:'
 abort_jobs_ss = 'arq:abort'
+interval_job_id_prefix = 'arq:interval-job:'
+interval_state_key_prefix = 'arq:interval:'
 # age of items in the abort_key sorted set after which they're deleted
 abort_job_max_age = 60
 health_check_key_suffix = ':health-check'

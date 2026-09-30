@@ -215,6 +215,20 @@ Note that ``second`` defaults to ``0`` so you don't in inadvertently run jobs ev
 defaults to ``123456`` so you don't inadvertently run jobs every microsecond and so *arq* avoids enqueuing jobs
 at the top of a second when the world is generally slightly busier.
 
+Completion Interval Jobs
+........................
+
+Use :func:`arq.cron.interval` when the gap between executions should be measured from when the previous execution
+finishes, rather than from a wall-clock schedule. The next run is stored in Redis and restored if a worker restarts.
+Redis also makes the due check atomic, so multiple workers enqueue at most one run.
+
+Each terminal outcome has an explicit ``continue_on_success``, ``continue_on_failure`` and
+``continue_on_cancel`` policy. Success continues by default, while failure and cancellation stop the schedule unless
+their option is enabled. An execution that runs longer than the interval does not queue catch-up runs; the timer
+starts from its actual completion time.
+
+.. literalinclude:: examples/interval.py
+
 Synchronous Jobs
 ................
 
@@ -256,7 +270,7 @@ Reference
    :members: func, Retry, Worker
 
 .. automodule:: arq.cron
-   :members: cron
+   :members: cron, interval
 
 .. automodule:: arq.jobs
    :members: JobStatus, Job

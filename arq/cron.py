@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional, Union
 
 from .typing import WEEKDAYS, OptionType, SecondsTimedelta, WeekdayOptionType, WorkerCoroutine
-from .utils import import_string, to_seconds
+from .utils import import_string, to_ms, to_seconds
 
 
 @dataclass
@@ -125,6 +125,24 @@ class CronJob:
         return '<CronJob {}>'.format(' '.join(f'{k}={v}' for k, v in self.__dict__.items()))
 
 
+@dataclass
+class IntervalJob:
+    name: str
+    coroutine: WorkerCoroutine
+    interval_ms: int
+    run_at_startup: bool
+    continue_on_success: bool
+    continue_on_failure: bool
+    continue_on_cancel: bool
+    timeout_s: Optional[float]
+    keep_result_s: Optional[float]
+    keep_result_forever: Optional[bool]
+    max_tries: Optional[int]
+
+    def __repr__(self) -> str:
+        return '<IntervalJob {}>'.format(' '.join(f'{k}={v}' for k, v in self.__dict__.items()))
+
+
 def cron(
     coroutine: Union[str, WorkerCoroutine],
     *,
@@ -198,3 +216,73 @@ def cron(
         keep_result_forever,
         max_tries,
     )
+
+
+def interval(
+    coroutine: Union[str, WorkerCoroutine],
+    *,
+    interval: Optional[SecondsTimedelta] = None,
+    seconds: Optional[SecondsTimedelta] = None,
+    name: Optional[str] = None,
+    run_at_startup: bool = False,
+    continue_on_success: bool = True,
+    continue_on_failure: bool = False,
+    continue_on_cancel: bool = False,
+    timeout: Optional[SecondsTimedelta] = None,
+    keep_result: Optional[SecondsTimedelta] = 0,
+    keep_result_forever: Optional[bool] = False,
+    max_tries: Optional[int] = 1,
+) -> IntervalJob:
+    """
+    Create a job that runs ``interval`` after the previous execution finished.
+
+    Successful executions schedule the next run by default. Set ``continue_on_failure`` or
+    ``continue_on_cancel`` to keep scheduling after those terminal outcomes.
+
+    :param coroutine: coroutine function to run
+    :param interval: time to wait after an execution completes before running again
+    :param name: name of the job, if None, the name of the coroutine is used
+    :param run_at_startup: whether to run as worker starts
+    :param continue_on_success: whether to continue after a successful execution
+    :param continue_on_failure: whether to continue after a failed execution
+    :param continue_on_cancel: whether to continue after a cancelled execution
+    :param timeout: job timeout
+    :param keep_result: how long to keep the result for
+    :param keep_result_forever: whether to keep results forever
+    :param max_tries: maximum number of tries for the job
+    """
+    if isinstance(coroutine, str):
+        name = name or 'interval:' + coroutine
+        coroutine_: WorkerCoroutine = import_string(coroutine)
+    else:
+        coroutine_ = coroutine
+
+    if not inspect.iscoroutinefunction(coroutine_):
+        raise RuntimeError(f'{coroutine_} is not a coroutine function')
+
+    if seconds is not None:
+        if interval is not None:
+            raise ValueError("use either 'interval' or 'seconds', not both")
+        interval = seconds
+    if interval is None:
+        raise ValueError("one of 'interval' or 'seconds' is required")
+    interval_ms = to_ms(interval)
+    if interval_ms is None or interval_ms <= 0:
+        raise ValueError('interval must be greater than zero')
+
+    return IntervalJob(
+        name or 'interval:' + coroutine_.__qualname__,
+        coroutine_,
+        interval_ms,
+        run_at_startup,
+        continue_on_success,
+        continue_on_failure,
+        continue_on_cancel,
+        to_seconds(timeout),
+        to_seconds(keep_result),
+        keep_result_forever,
+        max_tries,
+    )
+
+
+completion_interval = interval
