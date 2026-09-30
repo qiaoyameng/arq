@@ -201,6 +201,30 @@ Where the items have the following meaning:
 * ``j_ongoing`` the number of jobs currently being performed
 * ``j_retried`` the number of jobs retries run
 
+Auditing queue residue
+.......................
+
+Maintenance scripts can occasionally leave two kinds of residue: a queue member whose job payload has been deleted,
+or a job payload which is no longer a member of any queue. The separate ``arq-audit`` command uses non-blocking
+``SCAN`` operations and may be run while workers are active::
+
+    arq-audit --redis-url redis://localhost:6379/0
+
+The report distinguishes confirmed residue from normal deferred jobs, ready jobs, running jobs, retry waits, and
+states that should be inspected manually. It never modifies Redis by default. To prepare a bounded repair plan
+without applying it::
+
+    arq-audit --write-plan arq-repair.json --max-items 100
+
+Applying the plan re-checks every payload, queue membership, retry counter, result, and live execution lease. Jobs
+which have become active, queued, retried, or otherwise changed are skipped::
+
+    arq-audit --apply-plan arq-repair.json
+
+If queues do not share the default ``arq:queue`` prefix, include each one with repeated ``--queue`` options or use
+``--queue-prefix`` to match their common prefix. Queue names outside both ranges are intentionally not assumed to be
+orphans.
+
 Cron Jobs
 .........
 
@@ -260,6 +284,9 @@ Reference
 
 .. automodule:: arq.jobs
    :members: JobStatus, Job
+
+.. automodule:: arq.audit
+   :members: audit_redis, build_fix_plan, apply_fix_plan
 
 .. include:: ../HISTORY.rst
 
