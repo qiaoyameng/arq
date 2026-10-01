@@ -860,7 +860,7 @@ async def test_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
 
     async def wait_and_abort(job, delay=0.1):
         await asyncio.sleep(delay)
-        assert await job.abort() is True
+        assert bool(await job.abort()) is True
 
     caplog.set_level(logging.INFO)
     await arq_redis.zadd(abort_jobs_ss, {b'foobar': int(1e9)})
@@ -877,14 +877,14 @@ async def test_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
     assert worker.jobs_retried == 0
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs → testing:longfunc()\n  X.XXs ⊘ testing:longfunc aborted' in log
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.tasks == {}
     assert worker.job_tasks == {}
 
 
 async def test_abort_job_which_is_not_in_queue(arq_redis: ArqRedis):
     job = Job(job_id='testing', redis=arq_redis)
-    assert await job.abort() is False
+    assert bool(await job.abort()) is False
 
 
 async def test_abort_job_before(arq_redis: ArqRedis, worker, caplog, loop):
@@ -908,7 +908,7 @@ async def test_abort_job_before(arq_redis: ArqRedis, worker, caplog, loop):
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs ⊘ testing:longfunc aborted before start' in log
     await worker.main()
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.job_tasks == {}
     assert worker.tasks == {}
 
@@ -938,7 +938,7 @@ async def test_abort_deferred_job_before(arq_redis: ArqRedis, worker, caplog, lo
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs ⊘ testing:longfunc aborted before start' in log
     await worker.main()
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.job_tasks == {}
     assert worker.tasks == {}
 
@@ -949,7 +949,7 @@ async def test_not_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
 
     async def wait_and_abort(job, delay=0.1):
         await asyncio.sleep(delay)
-        assert await job.abort() is False
+        assert bool(await job.abort()) is False
 
     caplog.set_level(logging.INFO)
     job = await arq_redis.enqueue_job('shortfunc', _job_id='testing')
@@ -965,7 +965,7 @@ async def test_not_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs → testing:shortfunc()\n  X.XXs ← testing:shortfunc ●' in log
     await worker.main()
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.tasks == {}
     assert worker.job_tasks == {}
 
@@ -1032,7 +1032,7 @@ async def test_job_cancel_on_max_jobs(arq_redis: ArqRedis, worker, caplog):
 
     async def wait_and_abort(job, delay=0.1):
         await asyncio.sleep(delay)
-        assert await job.abort() is True
+        assert bool(await job.abort()) is True
 
     caplog.set_level(logging.INFO)
     await arq_redis.zadd(abort_jobs_ss, {b'foobar': int(1e9)})
@@ -1051,7 +1051,7 @@ async def test_job_cancel_on_max_jobs(arq_redis: ArqRedis, worker, caplog):
     assert worker.jobs_retried == 0
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs → testing:longfunc()\n  X.XXs ⊘ testing:longfunc aborted' in log
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.tasks == {}
     assert worker.job_tasks == {}
 

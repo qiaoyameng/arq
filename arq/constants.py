@@ -2,6 +2,7 @@ default_queue_name = 'arq:queue'
 job_key_prefix = 'arq:job:'
 in_progress_key_prefix = 'arq:in-progress:'
 result_key_prefix = 'arq:result:'
+abort_info_key_prefix = 'arq:abort-info:'
 retry_key_prefix = 'arq:retry:'
 abort_jobs_ss = 'arq:abort'
 # age of items in the abort_key sorted set after which they're deleted

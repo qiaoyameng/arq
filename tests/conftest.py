@@ -9,10 +9,44 @@ import pytest
 import redis.exceptions
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-from testcontainers.redis import RedisContainer
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from arq.worker import Worker
+
+try:  # docker is unavailable in some sandboxed environments, fall back to the
+    # in-process RESP server used by tests/test_abort.py in that case
+    from testcontainers.redis import RedisContainer
+
+    def _docker_available() -> bool:
+        try:
+            import docker
+
+            docker.from_env().ping()
+        except Exception:
+            return False
+        return True
+
+    _DOCKER_AVAILABLE = _docker_available()
+except Exception:  # pragma: no cover - depends on the sandbox
+    RedisContainer = None
+    _DOCKER_AVAILABLE = False
+
+if not _DOCKER_AVAILABLE:
+    sys.path.insert(0, os.path.dirname(__file__))
+    from mini_redis import MiniRedis, patch_connection_for
+
+    _MINI_REDIS = MiniRedis()
+    patch_connection_for(_MINI_REDIS)
+
+
+def pytest_configure(config):
+    if not _DOCKER_AVAILABLE:
+        # redis-py deprecated Redis.close() in favour of aclose(); the arq code
+        # base still calls close(), irrelevant to the in-process fallback server
+        config.addinivalue_line(
+            'filterwarnings',
+            'ignore:Call to deprecated close:DeprecationWarning',
+        )
 
 
 @pytest.fixture(name='loop')
@@ -27,17 +61,24 @@ def redis_version() -> str:
 
 @pytest.fixture(scope='session')
 def redis_container(redis_version: str) -> Generator[RedisContainer, None, None]:
+    if not _DOCKER_AVAILABLE:
+        yield None
+        return
     with RedisContainer(f'redis:{redis_version}') as redis:
         yield redis
 
 
 @pytest.fixture(scope='session')
 def test_redis_host(redis_container: RedisContainer) -> str:
+    if redis_container is None:
+        return '127.0.0.1'
     return redis_container.get_container_host_ip()
 
 
 @pytest.fixture(scope='session')
 def test_redis_port(redis_container: RedisContainer) -> int:
+    if redis_container is None:
+        return 1
     return redis_container.get_exposed_port(redis_container.port)
 
 

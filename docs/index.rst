@@ -176,6 +176,23 @@ in the queue.
 
 .. literalinclude:: examples/job_abort.py
 
+An abort request may carry a ``request_id`` and a human readable ``reason``;
+:func:`arq.jobs.Job.abort` returns an :class:`arq.jobs.AbortResult` describing what happened:
+
+* :attr:`arq.jobs.AbortStatus.before_start` the job had not started yet and was cancelled before start
+* :attr:`arq.jobs.AbortStatus.aborted` the job was running and the worker confirmed the cancellation
+* :attr:`arq.jobs.AbortStatus.already_finished` the job had already finished; its result is preserved
+  and the abort cannot overwrite it
+* :attr:`arq.jobs.AbortStatus.not_found` no trace of the job exists
+* :attr:`arq.jobs.AbortStatus.unconfirmed` the request was registered (``wait=False``) but not yet confirmed
+
+If the worker does not confirm within ``timeout`` an :class:`arq.jobs.AbortTimeoutError` is raised.
+When several requests race, the *first* request that takes effect wins: later requests report the same
+``request_id`` and ``reason`` and can never overwrite a finished result. The acknowledgement is stored in
+redis separately from the job result and kept for the same duration as the result. The winning reason is
+passed to the optional ``on_job_abort`` cleanup hook (in ``ctx['abort_reason']`` and
+``ctx['abort_request_id']``); it never replaces the job's business result.
+
 Health checks
 .............
 

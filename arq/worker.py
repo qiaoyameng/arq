@@ -18,6 +18,7 @@ from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, de
 
 from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
 from .constants import (
+    abort_info_key_prefix,
     abort_job_max_age,
     abort_jobs_ss,
     default_queue_name,
@@ -154,6 +155,9 @@ class Worker:
     :param on_job_start: coroutine function to run on job start
     :param on_job_end: coroutine function to run on job end
     :param after_job_end: coroutine function to run after job has ended and results have been recorded
+    :param on_job_abort: coroutine function to run when a job is cancelled by an abort request,
+      receives the abort reason in ``ctx['abort_reason']`` and the request id in
+      ``ctx['abort_request_id']``; it is a cleanup hook and cannot change the job result
     :param handle_signals: default true, register signal handlers,
       set to false when running inside other async framework
     :param job_completion_wait: time to wait before cancelling tasks after a signal.
@@ -198,6 +202,7 @@ class Worker:
         on_job_start: Optional['StartupShutdown'] = None,
         on_job_end: Optional['StartupShutdown'] = None,
         after_job_end: Optional['StartupShutdown'] = None,
+        on_job_abort: Optional['StartupShutdown'] = None,
         handle_signals: bool = True,
         job_completion_wait: int = 0,
         max_jobs: int = 10,
@@ -240,6 +245,7 @@ class Worker:
         self.on_job_start = on_job_start
         self.on_job_end = on_job_end
         self.after_job_end = after_job_end
+        self.on_job_abort = on_job_abort
 
         self.max_jobs = max_jobs
         self.sem = asyncio.BoundedSemaphore(max_jobs + 1)
@@ -294,7 +300,8 @@ class Worker:
         self.retry_jobs = retry_jobs
         self.allow_abort_jobs = allow_abort_jobs
         self.allow_pick_jobs: bool = True
-        self.aborting_tasks: set[str] = set()
+        # job_id -> (abort_request_id, abort_reason) for tasks cancelled while running
+        self.aborting_tasks: dict[str, tuple[Optional[str], Optional[str]]] = {}
         self.max_burst_jobs = max_burst_jobs
         self.job_serializer = job_serializer
         self.job_deserializer = job_deserializer
@@ -414,20 +421,30 @@ class Worker:
             pipe.zremrangebyscore(abort_jobs_ss, min=timestamp_ms() + abort_job_max_age, max=float('inf'))
             abort_job_ids, _ = await pipe.execute()
 
-        aborted: set[str] = set()
+        running: list[tuple[str, asyncio.Task[Any]]] = []
         for job_id_bytes in abort_job_ids:
             job_id = job_id_bytes.decode()
-            try:
-                task = self.job_tasks[job_id]
-            except KeyError:
-                pass
-            else:
-                aborted.add(job_id)
-                task.cancel()
+            task = self.job_tasks.get(job_id)
+            if task is not None:
+                running.append((job_id, task))
 
-        if aborted:
-            self.aborting_tasks.update(aborted)
-            await self.pool.zrem(abort_jobs_ss, *aborted)
+        if running:
+            # look up the abort reasons *before* cancelling so a cancellation can't
+            # be delivered while we are awaiting redis and get mistaken for a retry
+            reason_pipe = self.pool.pipeline(transaction=True)
+            for job_id, _ in running:
+                reason_pipe.hget(abort_info_key_prefix + job_id, 'id')
+                reason_pipe.hget(abort_info_key_prefix + job_id, 'r')
+            abort_infos = await reason_pipe.execute()
+
+            for (job_id, task), (request_id_b, reason_b) in zip(
+                running, zip(abort_infos[::2], abort_infos[1::2], strict=True), strict=True
+            ):
+                request_id = request_id_b.decode() if isinstance(request_id_b, bytes) else request_id_b
+                reason = reason_b.decode() if isinstance(reason_b, bytes) else reason_b
+                self.aborting_tasks[job_id] = (request_id, reason or None)
+                task.cancel()
+            await self.pool.zrem(abort_jobs_ss, *(job_id for job_id, _ in running))
 
     def _release_sem_dec_counter_on_complete(self) -> None:
         self.job_counter = self.job_counter - 1
@@ -477,22 +494,37 @@ class Worker:
 
     async def run_job(self, job_id: str, score: int) -> None:  # noqa: C901
         start_ms = timestamp_ms()
+        abort_request_id: Optional[str] = None
+        abort_reason: Optional[str] = None
         async with self.pool.pipeline(transaction=True) as pipe:
             pipe.get(job_key_prefix + job_id)
             pipe.incr(retry_key_prefix + job_id)
             pipe.expire(retry_key_prefix + job_id, 88400)
             if self.allow_abort_jobs:
                 pipe.zrem(abort_jobs_ss, job_id)
-                v, job_try, _, abort_job = await pipe.execute()
+                pipe.hget(abort_info_key_prefix + job_id, 'id')
+                pipe.hget(abort_info_key_prefix + job_id, 'r')
+                v, job_try, _, abort_job, abort_request_id_b, abort_reason_b = await pipe.execute()
             else:
                 v, job_try, _ = await pipe.execute()
-                abort_job = False
+                abort_job, abort_request_id_b, abort_reason_b = False, None, None
+
+        if abort_request_id_b is not None:
+            abort_request_id = (
+                abort_request_id_b.decode() if isinstance(abort_request_id_b, bytes) else abort_request_id_b
+            )
+            abort_reason = abort_reason_b.decode() if isinstance(abort_reason_b, bytes) else abort_reason_b
+            abort_reason = abort_reason or None
 
         function_name, enqueue_time_ms = '<unknown>', 0
         args: tuple[Any, ...] = ()
         kwargs: dict[Any, Any] = {}
 
-        async def job_failed(exc: BaseException) -> None:
+        async def job_failed(
+            exc: BaseException,
+            abort_request_id_: Optional[str] = None,
+            abort_reason_: Optional[str] = None,
+        ) -> None:
             self.jobs_failed += 1
             result_data_ = serialize_result(
                 function=function_name,
@@ -509,7 +541,7 @@ class Worker:
                 queue_name=self.queue_name,
                 job_id=job_id,
             )
-            await asyncio.shield(self.finish_failed_job(job_id, result_data_))
+            await asyncio.shield(self.finish_failed_job(job_id, result_data_, abort_request_id_, abort_reason_))
 
         if not v:
             logger.warning('job %s expired', job_id)
@@ -526,7 +558,18 @@ class Worker:
         if abort_job:
             t = (timestamp_ms() - enqueue_time_ms) / 1000
             logger.info('%6.2fs ⊘ %s:%s aborted before start', t, job_id, function_name)
-            return await job_failed(asyncio.CancelledError())
+            abort_ctx = {
+                **self.ctx,
+                'job_id': job_id,
+                'job_try': job_try,
+                'enqueue_time': ms_to_datetime(enqueue_time_ms),
+                'score': score,
+                'abort_request_id': abort_request_id,
+                'abort_reason': abort_reason,
+            }
+            if self.on_job_abort:
+                await self.on_job_abort(abort_ctx)
+            return await job_failed(asyncio.CancelledError(), abort_request_id, abort_reason)
 
         try:
             function: Union[Function, CronJob] = self.functions[function_name]
@@ -620,7 +663,11 @@ class Worker:
                 logger.info('%6.2fs ⊘ %s aborted', t, ref)
                 result = e
                 finish = True
-                self.aborting_tasks.remove(job_id)
+                abort_request_id, abort_reason = self.aborting_tasks.pop(job_id)
+                ctx['abort_request_id'] = abort_request_id
+                ctx['abort_reason'] = abort_reason
+                if self.on_job_abort:
+                    await self.on_job_abort(ctx)
                 self.jobs_failed += 1
             elif self.retry_jobs and isinstance(e, (asyncio.CancelledError, RetryJob)):
                 logger.info('%6.2fs ↻ %s cancelled, will be run again', t, ref)
@@ -673,6 +720,8 @@ class Worker:
                 keep_result_forever,
                 incr_score,
                 keep_in_progress,
+                abort_request_id if (finish and result is not no_result and not success) else None,
+                abort_reason if (finish and result is not no_result and not success) else None,
             )
         )
 
@@ -688,6 +737,8 @@ class Worker:
         keep_result_forever: bool,
         incr_score: Optional[int],
         keep_in_progress: Optional[float],
+        abort_request_id: Optional[str] = None,
+        abort_reason: Optional[str] = None,
     ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             delete_keys = []
@@ -704,13 +755,30 @@ class Worker:
                 delete_keys += [retry_key_prefix + job_id, job_key_prefix + job_id]
                 tr.zrem(abort_jobs_ss, job_id)
                 tr.zrem(self.queue_name, job_id)
+                if abort_request_id is not None:
+                    abort_key = abort_info_key_prefix + job_id
+                    # HSETNX: the first abort request that took effect wins forever
+                    tr.hsetnx(abort_key, 'id', abort_request_id)
+                    tr.hsetnx(abort_key, 'r', abort_reason or '')
+                    tr.hsetnx(abort_key, 'st', 'aborted')
+                    # keep the acknowledgement around as long as the job result
+                    if result_data and not keep_result_forever:
+                        result_ttl_ms = to_ms(result_timeout_s)
+                        if result_ttl_ms is not None:
+                            tr.pexpire(abort_key, result_ttl_ms)
             elif incr_score:
                 tr.zincrby(self.queue_name, incr_score, job_id)
             if delete_keys:
                 tr.delete(*delete_keys)
             await tr.execute()
 
-    async def finish_failed_job(self, job_id: str, result_data: Optional[bytes]) -> None:
+    async def finish_failed_job(
+        self,
+        job_id: str,
+        result_data: Optional[bytes],
+        abort_request_id: Optional[str] = None,
+        abort_reason: Optional[str] = None,
+    ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             tr.delete(
                 retry_key_prefix + job_id,
@@ -724,6 +792,16 @@ class Worker:
             if result_data is not None and keep_result:  # pragma: no branch
                 expire = 0 if self.keep_result_forever else self.keep_result_s
                 tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))
+            if abort_request_id is not None:
+                abort_key = abort_info_key_prefix + job_id
+                # HSETNX: the first abort request that took effect wins forever
+                tr.hsetnx(abort_key, 'id', abort_request_id)
+                tr.hsetnx(abort_key, 'r', abort_reason or '')
+                tr.hsetnx(abort_key, 'st', 'before_start')
+                if result_data is not None and keep_result and not self.keep_result_forever:
+                    failed_ttl_ms = to_ms(self.keep_result_s)
+                    if failed_ttl_ms is not None:
+                        tr.pexpire(abort_key, failed_ttl_ms)
             await tr.execute()
 
     async def heart_beat(self) -> None:

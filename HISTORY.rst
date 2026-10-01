@@ -3,6 +3,16 @@
 History
 -------
 
+unreleased
+..........
+
+* Extend ``Job.abort`` with ``request_id`` and ``reason``, returning an ``AbortResult`` that
+  distinguishes before-start cancellation, confirmed running cancellation, already finished jobs,
+  not found jobs and unconfirmed requests (``AbortTimeoutError`` when the confirmation times out).
+  The first effective abort request wins, a finished result is never overwritten, the abort
+  acknowledgement is stored separately from the job result with matching TTL, and the reason is
+  exposed to the new ``on_job_abort`` worker hook.
+
 v0.28.0 (2026-04-16)
 ....................
 

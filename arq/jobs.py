@@ -1,15 +1,24 @@
 import asyncio
 import logging
 import pickle
+import uuid
 import warnings
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
 
 from redis.asyncio import Redis
 
-from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from .constants import (
+    abort_info_key_prefix,
+    abort_jobs_ss,
+    default_queue_name,
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+)
 from .utils import ms_to_datetime, poll, timestamp_ms
 
 logger = logging.getLogger('arq.jobs')
@@ -20,6 +29,61 @@ Deserializer = Callable[[bytes], dict[str, Any]]
 
 class ResultNotFound(RuntimeError):
     pass
+
+
+class AbortTimeoutError(asyncio.TimeoutError):
+    """
+    Raised when an abort request was registered but the worker did not confirm
+    the cancellation within the requested timeout.
+    """
+
+    def __init__(self, request_id: str, reason: Optional[str]):
+        self.request_id = request_id
+        self.reason = reason
+        super().__init__(f'abort request {request_id!r} was not confirmed before the timeout')
+
+
+class AbortStatus(str, Enum):
+    """
+    Outcome of an abort request.
+    """
+
+    #: the job had not started running yet and was cancelled before start
+    before_start = 'before_start'
+    #: the job was running and the worker confirmed the cancellation
+    aborted = 'aborted'
+    #: the job had already finished (success, failure or retry); its result was preserved
+    already_finished = 'already_finished'
+    #: the job could not be found in the queue, in progress or among results
+    not_found = 'not_found'
+    #: the abort request was registered but the worker never confirmed it
+    unconfirmed = 'unconfirmed'
+
+
+@dataclass
+class AbortResult:
+    """
+    Acknowledgement of an abort request.
+
+    The object is truthy when the job was actually cancelled (``before_start`` or
+    ``aborted``), so existing ``if await job.abort():`` code keeps working.
+
+    :param status: outcome of the abort request, see :class:`AbortStatus`
+    :param request_id: id of the abort request that actually took effect;
+        when several requests race, this is always the *first* one
+    :param reason: cancellation reason that actually took effect, the first one wins
+    """
+
+    status: AbortStatus
+    request_id: Optional[str] = None
+    reason: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.status in (AbortStatus.before_start, AbortStatus.aborted)
+
+    @property
+    def confirmed(self) -> bool:
+        return bool(self)
 
 
 class JobStatus(str, Enum):
@@ -68,7 +132,7 @@ class Job:
     Holds data a reference to a job.
     """
 
-    __slots__ = 'job_id', '_redis', '_queue_name', '_deserializer'
+    __slots__ = '_deserializer', '_queue_name', '_redis', 'job_id'
 
     def __init__(
         self,
@@ -168,33 +232,127 @@ class Job:
         else:
             return JobStatus.not_found
 
-    async def abort(self, *, timeout: Optional[float] = None, poll_delay: float = 0.5) -> bool:
+    async def abort(
+        self,
+        *,
+        request_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        timeout: Optional[float] = None,
+        poll_delay: float = 0.5,
+        wait: bool = True,
+    ) -> AbortResult:
         """
-        Abort the job.
+        Request the job to be aborted.
 
-        :param timeout: maximum time to wait for the job result before raising ``TimeoutError``,
-            will wait forever on None
-        :param poll_delay: how often to poll redis for the job result
-        :return: True if the job aborted properly, False otherwise
+        The request is tagged with ``request_id`` and ``reason``; the worker records
+        an acknowledgement (in a separate hash, never inside the job result) once the
+        cancellation takes effect. When several abort requests race, the first one that
+        actually takes effect wins and later requests cannot overwrite it.
+
+        :param request_id: id of this abort request, auto generated if ``None``
+        :param reason: human readable reason for the cancellation, it is passed to the
+            worker's ``on_job_abort`` cleanup hook but never becomes the job's business result
+        :param timeout: maximum time to wait for the worker to confirm the cancellation;
+            ``None`` waits forever and ``0`` registers the request and raises
+            :class:`AbortTimeoutError` immediately without waiting
+        :param poll_delay: how often to poll redis for the acknowledgement
+        :param wait: when False only register the request and immediately return an
+            ``unconfirmed`` acknowledgement, never raise :class:`AbortTimeoutError`
+        :return: an :class:`AbortResult` describing the outcome
+        :raises AbortTimeoutError: the request was registered but not confirmed in time
         """
-        job_info = await self.info()
-        if job_info and job_info.score and job_info.score > timestamp_ms():
+        if request_id is None:
+            request_id = uuid.uuid4().hex
+
+        now = timestamp_ms()
+        abort_key = abort_info_key_prefix + self.job_id
+
+        # 1. fast paths: a finished result or no trace of the job at all
+        async with self._redis.pipeline(transaction=True) as tr:
+            tr.exists(result_key_prefix + self.job_id)
+            tr.exists(in_progress_key_prefix + self.job_id)
+            tr.zscore(self._queue_name, self.job_id)
+            is_complete, is_in_progress, score = await tr.execute()
+
+        if is_complete:
+            info = await self._read_abort_info(abort_key)
+            status = info['st'] if info and info.get('st') else AbortStatus.already_finished.value
+            return AbortResult(AbortStatus(status), info.get('id') if info else None, info.get('r') if info else None)
+
+        if not is_in_progress and score is None:
+            return AbortResult(AbortStatus.not_found)
+
+        # 2. register the request. The zset is the worker's wake-up signal;
+        # the hash fields use HSETNX so the first effective request wins.
+        if score and score > now:
+            # deferred job: move it to the front of the queue so it is picked up
+            # and cancelled before start rather than waiting for its scheduled time
             async with self._redis.pipeline(transaction=True) as tr:
                 tr.zrem(self._queue_name, self.job_id)
                 tr.zadd(self._queue_name, {self.job_id: 1})
                 await tr.execute()
 
-        await self._redis.zadd(abort_jobs_ss, {self.job_id: timestamp_ms()})
+        async with self._redis.pipeline(transaction=True) as tr:
+            tr.zadd(abort_jobs_ss, {self.job_id: now})
+            tr.hsetnx(abort_key, 'id', request_id)
+            tr.hsetnx(abort_key, 'r', reason if reason is not None else '')
+            await tr.execute()
 
-        try:
-            await self.result(timeout=timeout, poll_delay=poll_delay)
-        except asyncio.CancelledError:
-            return True
-        except ResultNotFound:
-            # We do not know if the job was cancelled or not
-            return False
-        else:
-            return False
+        if not wait:
+            return AbortResult(AbortStatus.unconfirmed, request_id, reason)
+
+        if timeout == 0:
+            raise AbortTimeoutError(request_id, reason)
+
+        # only conclude "already finished" from disappearing keys once we have
+        # observed the worker actually processing the job; a queued job is simply
+        # waiting for a free worker
+        seen_started = bool(is_in_progress)
+
+        # 3. wait for the worker's acknowledgement. The result of a finished job
+        # always wins over a late abort: we never overwrite or ignore it.
+        async for delay in poll(poll_delay):
+            info = await self._read_abort_info(abort_key)
+            if info and info.get('st'):
+                return AbortResult(AbortStatus(info['st']), info.get('id') or request_id, info.get('r') or None)
+
+            if await self._redis.exists(result_key_prefix + self.job_id):
+                # the job finished normally at the same time as the abort request
+                return AbortResult(
+                    AbortStatus.already_finished,
+                    info.get('id') if info else request_id,
+                    info.get('r') if info else reason,
+                )
+
+            async with self._redis.pipeline(transaction=True) as tr:
+                tr.zscore(self._queue_name, self.job_id)
+                tr.exists(in_progress_key_prefix + self.job_id)
+                queued_score, is_in_progress = await tr.execute()
+            if is_in_progress:
+                seen_started = True
+            elif seen_started and queued_score is None:
+                return AbortResult(
+                    AbortStatus.already_finished,
+                    (info.get('id') if info else request_id),
+                    (info.get('r') if info else reason),
+                )
+
+            if timeout is not None and delay > timeout:
+                raise AbortTimeoutError(request_id, reason)
+        raise RuntimeError('unreachable: poll() loop should not terminate')
+
+    async def _read_abort_info(self, abort_key: str) -> Optional[dict[str, str]]:
+        redis = cast(Any, self._redis)
+        request_id = await cast('Awaitable[Any]', redis.hget(abort_key, 'id'))
+        if request_id is None:
+            return None
+        reason = await cast('Awaitable[Any]', redis.hget(abort_key, 'r'))
+        status = await cast('Awaitable[Any]', redis.hget(abort_key, 'st'))
+
+        def _str(v: Any) -> str:
+            return v.decode() if isinstance(v, bytes) else (v or '')
+
+        return {'id': _str(request_id), 'r': _str(reason), 'st': _str(status)}
 
     def __repr__(self) -> str:
         return f'<arq job {self.job_id}>'
