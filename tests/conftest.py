@@ -9,10 +9,13 @@ import pytest
 import redis.exceptions
 from redis.asyncio.retry import Retry
 from redis.backoff import NoBackoff
-from testcontainers.redis import RedisContainer
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from arq.worker import Worker
+
+
+def _test_redis_address() -> tuple[str, int]:
+    return os.getenv('ARQ_TEST_REDIS_HOST', '127.0.0.1'), int(os.getenv('ARQ_TEST_REDIS_PORT', '6399'))
 
 
 @pytest.fixture(name='loop')
@@ -26,19 +29,35 @@ def redis_version() -> str:
 
 
 @pytest.fixture(scope='session')
-def redis_container(redis_version: str) -> Generator[RedisContainer, None, None]:
-    with RedisContainer(f'redis:{redis_version}') as redis:
-        yield redis
+def test_redis_host() -> str:
+    return _test_redis_address()[0]
 
 
 @pytest.fixture(scope='session')
-def test_redis_host(redis_container: RedisContainer) -> str:
-    return redis_container.get_container_host_ip()
+def test_redis_port() -> int:
+    return _test_redis_address()[1]
 
 
-@pytest.fixture(scope='session')
-def test_redis_port(redis_container: RedisContainer) -> int:
-    return redis_container.get_exposed_port(redis_container.port)
+@pytest.fixture(scope='session', autouse=True)
+def _local_fake_redis() -> Generator[object, None, None]:
+    """
+    When no external redis is reachable (ARQ_TEST_REDIS_HOST/ARQ_TEST_REDIS_PORT) the tests use an
+    in-process implementation of the redis protocol - no docker or redis-server required.
+    """
+    from redis.asyncio import connection as redis_connection
+
+    from tests._localredis.connection import FakeRedisConnection, SERVER
+
+    original = redis_connection.Connection
+    pool_init = redis_connection.ConnectionPool.__init__
+    original_pool_defaults = pool_init.__defaults__
+    pool_init.__defaults__ = (FakeRedisConnection, *original_pool_defaults[1:])
+    redis_connection.Connection = FakeRedisConnection
+    try:
+        yield SERVER
+    finally:
+        redis_connection.Connection = original
+        pool_init.__defaults__ = original_pool_defaults
 
 
 @pytest.fixture(scope='session')

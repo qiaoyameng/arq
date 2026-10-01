@@ -176,6 +176,23 @@ in the queue.
 
 .. literalinclude:: examples/job_abort.py
 
+The method takes an optional ``request_id`` (to correlate or deduplicate requests) and a human readable
+``reason``, and returns an :class:`arq.jobs.AbortResult` receipt whose ``status`` is one of
+
+* ``AbortStatus.before_start`` - the job was still queued (or deferred) and was cancelled without running,
+* ``AbortStatus.confirmed`` - a worker confirmed the running job was interrupted,
+* ``AbortStatus.already_finished`` - the job had already finished (success, failure or an earlier abort)
+  before this abort took effect,
+* ``AbortStatus.timeout`` - the abort was requested but no worker confirmed it within ``timeout``.
+
+When abort requests race each other or race the job completing, the request that actually interrupts the
+job wins. A completed result is never overwritten by a later abort, and ``effective_request_id`` /
+``effective_reason`` on every receipt identify the first, effective request.
+
+The abort reason is metadata: it is exposed to the ``on_job_end`` and ``after_job_end`` hooks through
+``ctx['abort_request_id']`` and ``ctx['abort_reason']``, but :meth:`arq.jobs.Job.result` still raises
+``asyncio.CancelledError`` for aborted jobs - the reason never becomes the job's business result.
+
 Health checks
 .............
 

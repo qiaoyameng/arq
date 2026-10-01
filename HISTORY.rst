@@ -3,6 +3,16 @@
 History
 -------
 
+unreleased
+..........
+
+* ``Job.abort`` now accepts ``request_id`` and ``reason`` and returns an ``AbortResult`` receipt that
+  distinguishes jobs cancelled before they started, aborts confirmed while running, jobs that had already
+  finished and aborts never confirmed within the timeout. Concurrent aborts can no longer overwrite a
+  completed result; the worker keeps the reason of the first abort request that actually interrupted the
+  job and passes it to the ``on_job_end`` / ``after_job_end`` hooks (the reason stays metadata and never
+  becomes the job's business result).
+
 v0.28.0 (2026-04-16)
 ....................
 

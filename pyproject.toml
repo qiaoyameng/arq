@@ -97,6 +97,7 @@ filterwarnings = [
    '''ignore:'asyncio.iscoroutinefunction' is deprecated:DeprecationWarning''',
    '''ignore:'asyncio.get_event_loop_policy' is deprecated:DeprecationWarning''',
    '''ignore:'asyncio.set_event_loop_policy' is deprecated:DeprecationWarning''',
+   '''ignore:Call to deprecated close:DeprecationWarning''',
 ]
 asyncio_mode = 'auto'
 timeout = 10

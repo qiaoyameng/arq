@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import functools
 import logging
 import re
@@ -12,8 +13,17 @@ import pytest
 import redis.exceptions
 
 from arq.connections import ArqRedis, RedisSettings
-from arq.constants import abort_jobs_ss, default_queue_name, expires_extra_ms, health_check_key_suffix, job_key_prefix
-from arq.jobs import Job, JobStatus
+from arq.constants import (
+    abort_jobs_ss,
+    abort_outcome_key_prefix,
+    abort_request_key_prefix,
+    default_queue_name,
+    expires_extra_ms,
+    health_check_key_suffix,
+    job_key_prefix,
+    result_key_prefix,
+)
+from arq.jobs import AbortStatus, Job, JobStatus, deserialize_abort_outcome
 from arq.worker import (
     FailedJobs,
     JobExecutionFailed,
@@ -860,7 +870,11 @@ async def test_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
 
     async def wait_and_abort(job, delay=0.1):
         await asyncio.sleep(delay)
-        assert await job.abort() is True
+        receipt = await job.abort(request_id='req-1', reason='stopping')
+        assert receipt.status is AbortStatus.confirmed
+        assert bool(receipt) is True
+        assert receipt.effective_request_id == 'req-1'
+        assert receipt.effective_reason == 'stopping'
 
     caplog.set_level(logging.INFO)
     await arq_redis.zadd(abort_jobs_ss, {b'foobar': int(1e9)})
@@ -877,14 +891,14 @@ async def test_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
     assert worker.jobs_retried == 0
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs → testing:longfunc()\n  X.XXs ⊘ testing:longfunc aborted' in log
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.tasks == {}
     assert worker.job_tasks == {}
 
 
 async def test_abort_job_which_is_not_in_queue(arq_redis: ArqRedis):
     job = Job(job_id='testing', redis=arq_redis)
-    assert await job.abort() is False
+    assert (await job.abort()).status is AbortStatus.already_finished
 
 
 async def test_abort_job_before(arq_redis: ArqRedis, worker, caplog, loop):
@@ -899,16 +913,19 @@ async def test_abort_job_before(arq_redis: ArqRedis, worker, caplog, loop):
     assert worker.jobs_complete == 0
     assert worker.jobs_failed == 0
     assert worker.jobs_retried == 0
-    with pytest.raises(asyncio.TimeoutError):
-        await job.abort(timeout=0)
-    await worker.main()
+
+    async def abort_before_start() -> None:
+        receipt_ = await job.abort(timeout=2, poll_delay=0.05)
+        assert receipt_.status is AbortStatus.before_start
+
+    await asyncio.gather(abort_before_start(), worker.main())
     assert worker.jobs_complete == 0
     assert worker.jobs_failed == 1
     assert worker.jobs_retried == 0
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs ⊘ testing:longfunc aborted before start' in log
     await worker.main()
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.job_tasks == {}
     assert worker.tasks == {}
 
@@ -928,9 +945,11 @@ async def test_abort_deferred_job_before(arq_redis: ArqRedis, worker, caplog, lo
     assert worker.jobs_failed == 0
     assert worker.jobs_retried == 0
 
-    with pytest.raises(asyncio.TimeoutError):
-        await job.abort(timeout=0)
-    await worker.main()
+    async def abort_before_start() -> None:
+        receipt_ = await job.abort(timeout=2, poll_delay=0.05)
+        assert receipt_.status is AbortStatus.before_start
+
+    await asyncio.gather(abort_before_start(), worker.main())
 
     assert worker.jobs_complete == 0
     assert worker.jobs_failed == 1
@@ -938,7 +957,7 @@ async def test_abort_deferred_job_before(arq_redis: ArqRedis, worker, caplog, lo
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs ⊘ testing:longfunc aborted before start' in log
     await worker.main()
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.job_tasks == {}
     assert worker.tasks == {}
 
@@ -949,7 +968,7 @@ async def test_not_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
 
     async def wait_and_abort(job, delay=0.1):
         await asyncio.sleep(delay)
-        assert await job.abort() is False
+        assert (await job.abort()).status is AbortStatus.already_finished
 
     caplog.set_level(logging.INFO)
     job = await arq_redis.enqueue_job('shortfunc', _job_id='testing')
@@ -965,9 +984,268 @@ async def test_not_abort_job(arq_redis: ArqRedis, worker, caplog, loop):
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs → testing:shortfunc()\n  X.XXs ← testing:shortfunc ●' in log
     await worker.main()
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.tasks == {}
     assert worker.job_tasks == {}
+
+
+async def test_abort_running_confirmed_with_request_id_and_reason(arq_redis: ArqRedis, worker, caplog):
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    caplog.set_level(logging.INFO)
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(functions=[func(longfunc, name='longfunc')], allow_abort_jobs=True, poll_delay=0.05)
+
+    async def wait_and_abort():
+        await asyncio.sleep(0.15)
+        return await job.abort(request_id='req-running', reason='please stop', poll_delay=0.05)
+
+    receipt, _ = await asyncio.gather(wait_and_abort(), worker.main())
+
+    assert receipt.status is AbortStatus.confirmed
+    assert receipt.request_id == 'req-running'
+    assert receipt.effective_request_id == 'req-running'
+    assert receipt.effective_reason == 'please stop'
+    assert bool(receipt) is True
+
+    info = await job.result_info()
+    assert info is not None
+    assert info.abort_phase == 'running'
+    assert info.abort_request_id == 'req-running'
+    assert info.abort_reason == 'please stop'
+    # the reason is metadata, never the business result: Job.result still raises CancelledError
+    with pytest.raises(asyncio.CancelledError):
+        await job.result()
+
+    outcome = deserialize_abort_outcome(await arq_redis.get(abort_outcome_key_prefix + 'testing'))
+    assert outcome.request_id == 'req-running'
+    assert outcome.reason == 'please stop'
+    assert outcome.phase == 'running'
+    assert await arq_redis.get(abort_request_key_prefix + 'testing') is None
+    await worker.main()
+
+
+async def test_abort_before_start_carries_request_id_and_reason(arq_redis: ArqRedis, worker):
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(functions=[func(longfunc, name='longfunc')], allow_abort_jobs=True, poll_delay=0.05)
+
+    # abort while the job is still queued and no worker has picked it up
+    receipt = await job.abort(request_id='req-early', reason='not needed anymore', timeout=0, poll_delay=0)
+    assert receipt.status is AbortStatus.timeout
+    await worker.main()
+
+    # the worker subsequently finds the abort marker and cancels before running the function
+    outcome = deserialize_abort_outcome(await arq_redis.get(abort_outcome_key_prefix + 'testing'))
+    assert outcome.phase == 'before_start'
+    assert outcome.request_id == 'req-early'
+    assert outcome.reason == 'not needed anymore'
+
+    info = await job.result_info()
+    assert info is not None
+    assert info.abort_phase == 'before_start'
+    assert info.abort_request_id == 'req-early'
+    assert worker.jobs_complete == 0
+    assert worker.jobs_failed == 1
+    await worker.main()
+
+
+async def test_abort_timeout_unconfirmed(arq_redis: ArqRedis, worker):
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    # no worker is running the job, so the abort cannot be confirmed
+    worker: Worker = worker(functions=[func(longfunc, name='longfunc')], allow_abort_jobs=True)
+    receipt = await job.abort(timeout=0, poll_delay=0)
+    assert receipt.status is AbortStatus.timeout
+    assert bool(receipt) is False
+    # a second abort after timeout is still pending (no result got overwritten)
+    assert (await job.status()) is JobStatus.queued
+    await worker.close()
+
+
+async def test_abort_first_reason_wins(arq_redis: ArqRedis, worker):
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(functions=[func(longfunc, name='longfunc')], allow_abort_jobs=True, poll_delay=0.02)
+
+    receipts = []
+
+    async def abort_later(request_id, reason, delay):
+        await asyncio.sleep(delay)
+        receipt = await job.abort(request_id=request_id, reason=reason, poll_delay=0.02)
+        receipts.append(receipt)
+
+    await asyncio.gather(
+        abort_later('first', 'first reason', 0.15),
+        abort_later('second', 'second reason', 0.2),
+        worker.main(),
+    )
+
+    assert len(receipts) == 2
+    assert all(r.status is AbortStatus.confirmed for r in receipts)
+    # both receipts agree on the first, effective request
+    assert {r.effective_request_id for r in receipts} == {'first'}
+    assert {r.effective_reason for r in receipts} == {'first reason'}
+
+    info = await job.result_info()
+    assert info is not None
+    assert info.abort_request_id == 'first'
+    assert info.abort_reason == 'first reason'
+
+    outcome = deserialize_abort_outcome(await arq_redis.get(abort_outcome_key_prefix + 'testing'))
+    assert outcome.request_id == 'first'
+    assert outcome.reason == 'first reason'
+    await worker.main()
+
+
+async def test_abort_keeps_completed_result_when_job_races_abort(arq_redis: ArqRedis, worker):
+    """
+    Abort and job completion happen at the same time: the normal result must never be overwritten
+    by a cancel, and both the final result and the abort receipt must agree on what happened.
+    """
+
+    running = asyncio.Event()
+    can_finish = asyncio.Event()
+
+    async def shortfunc(ctx):
+        running.set()
+        await can_finish.wait()
+        return 'business-value'
+
+    job = await arq_redis.enqueue_job('shortfunc', _job_id='testing')
+    worker: Worker = worker(
+        functions=[func(shortfunc, name='shortfunc', keep_result=10)],
+        allow_abort_jobs=True,
+        poll_delay=0.01,
+        burst=False,
+    )
+
+    worker_task = asyncio.get_event_loop().create_task(worker.main())
+    await running.wait()
+    can_finish.set()
+    # wait until the worker has actually recorded the completed result
+    assert await job.result(timeout=2, poll_delay=0.005) == 'business-value'
+    # now race an abort against a job that is already finished
+    receipt = await job.abort(request_id='race', reason='late', timeout=0.2, poll_delay=0.005)
+    worker.allow_pick_jobs = False
+    worker_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await worker_task
+
+    # the job genuinely completed, so the late cancel reports already_finished
+    assert receipt.status is AbortStatus.already_finished
+    assert worker.jobs_complete == 1
+    assert worker.jobs_failed == 0
+
+    info = await job.result_info()
+    assert info is not None
+    assert info.success is True
+    assert info.result == 'business-value'
+    assert info.abort_phase is None
+    # the business value is intact
+    assert await job.result(poll_delay=0) == 'business-value'
+    # no abort outcome: the cancel never interrupted anything
+    assert await arq_redis.get(abort_outcome_key_prefix + 'testing') is None
+    # the result TTL is the configured keep_result, not the abort-outcome TTL
+    ttl = await arq_redis.ttl(result_key_prefix + 'testing')
+    assert 0 < ttl <= 10
+
+
+async def test_multiple_aborts_never_overwrite_completed_result(arq_redis: ArqRedis, worker):
+    async def shortfunc(ctx):
+        await asyncio.sleep(0.05)
+        return 'final'
+
+    job = await arq_redis.enqueue_job('shortfunc', _job_id='testing')
+    worker: Worker = worker(
+        functions=[func(shortfunc, name='shortfunc', keep_result=10)],
+        allow_abort_jobs=True,
+        poll_delay=0.01,
+    )
+
+    async def abort_later(rid):
+        await asyncio.sleep(0.1 + 0.02 * int(rid))
+        return await job.abort(request_id=rid, reason='late-' + rid, timeout=0.2, poll_delay=0.005)
+
+    receipts = await asyncio.gather(
+        *[abort_later(str(i)) for i in range(3)], worker.main()
+    )
+    abort_receipts = receipts[:-1]
+    assert all(r.status is AbortStatus.already_finished for r in abort_receipts)
+
+    # only the business result exists; nothing aborts overwrote it
+    assert await arq_redis.get(abort_outcome_key_prefix + 'testing') is None
+    assert await job.result(poll_delay=0) == 'final'
+
+
+async def test_abort_outcome_ttl_matches_keep_result_for_running_abort(arq_redis: ArqRedis, worker):
+    from arq.constants import abort_outcome_keep_s
+
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(
+        functions=[func(longfunc, name='longfunc', keep_result=2)],
+        allow_abort_jobs=True,
+        poll_delay=0.02,
+    )
+
+    async def abort_later():
+        await asyncio.sleep(0.15)
+        return await job.abort(poll_delay=0.02, timeout=2)
+
+    receipt, _ = await asyncio.gather(abort_later(), worker.main())
+    assert receipt.status is AbortStatus.confirmed
+
+    result_ttl = await arq_redis.ttl(result_key_prefix + 'testing')
+    outcome_ttl = await arq_redis.ttl(abort_outcome_key_prefix + 'testing')
+    assert 0 < result_ttl <= 2
+    # the outcome is kept with the standalone abort TTL (same scale as the default keep_result)
+    assert 0 < outcome_ttl <= abort_outcome_keep_s
+    await worker.main()
+
+
+async def test_abort_reason_passed_to_cleanup_hooks_but_not_result(arq_redis: ArqRedis, worker):
+    seen = {}
+
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    async def on_end(ctx):
+        seen['on_job_end'] = (ctx.get('abort_request_id'), ctx.get('abort_reason'))
+
+    async def after_end(ctx):
+        seen['after_job_end'] = (ctx.get('abort_request_id'), ctx.get('abort_reason'))
+
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(
+        functions=[func(longfunc, name='longfunc')],
+        allow_abort_jobs=True,
+        poll_delay=0.02,
+        on_job_end=on_end,
+        after_job_end=after_end,
+    )
+
+    async def abort_later():
+        await asyncio.sleep(0.15)
+        return await job.abort(request_id='hook-req', reason='hook reason', poll_delay=0.02)
+
+    receipt, _ = await asyncio.gather(abort_later(), worker.main())
+    assert receipt.status is AbortStatus.confirmed
+    assert seen['on_job_end'] == ('hook-req', 'hook reason')
+    assert seen['after_job_end'] == ('hook-req', 'hook reason')
+    # Job.result surfaces CancelledError, not the reason text
+    with pytest.raises(asyncio.CancelledError):
+        await job.result()
+    await worker.main()
 
 
 async def test_job_timeout(arq_redis: ArqRedis, worker, caplog):
@@ -1032,7 +1310,7 @@ async def test_job_cancel_on_max_jobs(arq_redis: ArqRedis, worker, caplog):
 
     async def wait_and_abort(job, delay=0.1):
         await asyncio.sleep(delay)
-        assert await job.abort() is True
+        assert (await job.abort()).status is AbortStatus.confirmed
 
     caplog.set_level(logging.INFO)
     await arq_redis.zadd(abort_jobs_ss, {b'foobar': int(1e9)})
@@ -1051,7 +1329,7 @@ async def test_job_cancel_on_max_jobs(arq_redis: ArqRedis, worker, caplog):
     assert worker.jobs_retried == 0
     log = re.sub(r'\d+.\d\ds', 'X.XXs', '\n'.join(r.message for r in caplog.records))
     assert 'X.XXs → testing:longfunc()\n  X.XXs ⊘ testing:longfunc aborted' in log
-    assert worker.aborting_tasks == set()
+    assert worker.aborting_tasks == {}
     assert worker.tasks == {}
     assert worker.job_tasks == {}
 
@@ -1136,3 +1414,52 @@ async def test_worker_crash(mocker, worker, exception_thrown):
     finally:
         # stop patch to allow worker cleanup
         p.stop()
+
+
+async def test_abort_request_key_is_write_once(arq_redis: ArqRedis, worker):
+    from arq.jobs import deserialize_abort_request, serialize_abort_request
+
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    job = await arq_redis.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(functions=[func(longfunc, name='longfunc')], allow_abort_jobs=True)
+
+    key = abort_request_key_prefix + 'testing'
+    first = serialize_abort_request('first', 'first reason')
+    second = serialize_abort_request('second', 'second reason')
+    ok1 = await arq_redis.set(key, first, nx=True)
+    ok2 = await arq_redis.set(key, second, nx=True)
+    assert ok1 is True
+    assert ok2 is None
+
+    assert deserialize_abort_request(await arq_redis.get(key)) == ('first', 'first reason')
+    await worker.close()
+
+
+async def test_abort_with_msgpack_serializer(arq_redis_msgpack: ArqRedis, worker):
+    async def longfunc(ctx):
+        await asyncio.sleep(3600)
+
+    job = await arq_redis_msgpack.enqueue_job('longfunc', _job_id='testing')
+    worker: Worker = worker(
+        arq_redis=arq_redis_msgpack,
+        functions=[func(longfunc, name='longfunc')],
+        allow_abort_jobs=True,
+        poll_delay=0.02,
+        job_serializer=msgpack.packb,
+        job_deserializer=functools.partial(msgpack.unpackb, raw=False),
+    )
+
+    async def abort_later():
+        await asyncio.sleep(0.15)
+        return await job.abort(request_id='mp-req', reason='mp reason', poll_delay=0.02, timeout=2)
+
+    receipt, _ = await asyncio.gather(abort_later(), worker.main())
+    assert receipt.status is AbortStatus.confirmed
+    info = await job.result_info()
+    assert info is not None
+    assert info.abort_phase == 'running'
+    assert info.abort_request_id == 'mp-req'
+    assert info.abort_reason == 'mp reason'
+    await worker.main()

@@ -13,7 +13,10 @@ async def main():
     redis = await create_pool(RedisSettings())
     job = await redis.enqueue_job('do_stuff')
     await asyncio.sleep(1)
-    await job.abort()
+    # every abort request can carry an id and a reason; the receipt reports what actually happened:
+    # before_start / confirmed / already_finished / timeout
+    receipt = await job.abort(request_id='request-1', reason='no longer needed')
+    print(receipt.status, receipt.effective_reason)
 
 
 class WorkerSettings:

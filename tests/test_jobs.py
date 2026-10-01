@@ -222,3 +222,84 @@ async def test_result_pole_delay_dep(arq_redis: ArqRedis):
         DeprecationWarning, match='"pole_delay" is deprecated, use the correct spelling "poll_delay" instead'
     ):
         assert await j.result(pole_delay=0) == 42
+
+
+def test_abort_result_truthiness():
+    from arq.jobs import AbortResult, AbortStatus
+
+    assert bool(AbortResult('r', None, AbortStatus.confirmed)) is True
+    assert bool(AbortResult('r', None, AbortStatus.before_start)) is True
+    assert bool(AbortResult('r', None, AbortStatus.already_finished)) is False
+    assert bool(AbortResult('r', None, AbortStatus.timeout)) is False
+
+
+def test_serialized_abort_result_keeps_abort_metadata():
+    blob = serialize_result(
+        'foobar',
+        (),
+        {},
+        1,
+        123,
+        False,
+        asyncio.CancelledError(),
+        123,
+        124,
+        'testing',
+        'test-queue',
+        'job_1',
+        abort_phase='running',
+        abort_request_id='req-1',
+        abort_reason='because',
+    )
+    result = pickle.loads(blob)
+    assert result['ap'] == 'running'
+    assert result['arid'] == 'req-1'
+    assert result['arr'] == 'because'
+
+    from arq.jobs import deserialize_result
+
+    info = deserialize_result(blob)
+    assert info.abort_phase == 'running'
+    assert info.abort_request_id == 'req-1'
+    assert info.abort_reason == 'because'
+
+
+def test_serialized_plain_result_has_no_abort_metadata():
+    blob = serialize_result(
+        'foobar', (), {}, 1, 123, True, 42, 123, 124, 'testing', 'test-queue', 'job_1'
+    )
+    info = pickle.loads(blob)
+    assert 'ap' not in info and 'arid' not in info and 'arr' not in info
+    from arq.jobs import deserialize_result
+
+    assert deserialize_result(blob).abort_phase is None
+
+
+def test_abort_request_and_outcome_serialization_roundtrip():
+    from arq.jobs import (
+        deserialize_abort_outcome,
+        deserialize_abort_request,
+        serialize_abort_outcome,
+        serialize_abort_request,
+    )
+
+    blob = serialize_abort_request('req-42', 'why')
+    assert deserialize_abort_request(blob) == ('req-42', 'why')
+
+    outcome = deserialize_abort_outcome(serialize_abort_outcome('req-42', 'why', 'before_start'))
+    assert outcome.request_id == 'req-42'
+    assert outcome.reason == 'why'
+    assert outcome.phase == 'before_start'
+
+
+async def test_abort_already_finished_job(arq_redis: ArqRedis):
+    from arq.jobs import AbortStatus
+
+    j = await arq_redis.enqueue_job('foobar', _job_id='done')
+    await arq_redis.set(result_key_prefix + 'done', serialize_result(
+        'foobar', (), {}, 1, 1, True, 'value', 1, 2, 'done', 'arq:queue', 'done'
+    ))
+    receipt = await j.abort(timeout=0, poll_delay=0)
+    assert receipt.status is AbortStatus.already_finished
+    # no abort request marker left behind
+    assert await arq_redis.zscore('arq:abort', 'done') is None

@@ -6,10 +6,19 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Optional
+from uuid import uuid4
 
 from redis.asyncio import Redis
 
-from .constants import abort_jobs_ss, default_queue_name, in_progress_key_prefix, job_key_prefix, result_key_prefix
+from .constants import (
+    abort_jobs_ss,
+    abort_outcome_key_prefix,
+    abort_request_key_prefix,
+    default_queue_name,
+    in_progress_key_prefix,
+    job_key_prefix,
+    result_key_prefix,
+)
 from .utils import ms_to_datetime, poll, timestamp_ms
 
 logger = logging.getLogger('arq.jobs')
@@ -39,6 +48,56 @@ class JobStatus(str, Enum):
     not_found = 'not_found'
 
 
+class AbortStatus(str, Enum):
+    """
+    Outcome of an :meth:`Job.abort` call.
+    """
+
+    #: the job had not started yet (it was still queued or deferred) and was cancelled
+    before_start = 'before_start'
+    #: the job was running and the worker confirmed that it was interrupted
+    confirmed = 'confirmed'
+    #: the job had already finished (success, failure or an earlier abort) before this abort took effect
+    already_finished = 'already_finished'
+    #: the abort was requested, but no worker confirmed interrupting the job before ``timeout`` elapsed
+    timeout = 'timeout'
+
+
+@dataclass
+class AbortResult:
+    """
+    Receipt describing what happened to an abort request.
+
+    ``request_id`` and ``reason`` are the values supplied to :meth:`Job.abort`. ``status`` tells whether
+    the job was cancelled before it started, cancelled while running, had already finished or whether the
+    cancellation was never confirmed.
+
+    When an earlier abort request is the one that actually interrupted the job, ``effective_request_id`` and
+    ``effective_reason`` carry that first, effective request. Otherwise they match ``request_id`` and
+    ``reason``.
+    """
+
+    request_id: str
+    reason: Optional[str]
+    status: AbortStatus
+    effective_request_id: Optional[str] = None
+    effective_reason: Optional[str] = None
+
+    def __bool__(self) -> bool:
+        return self.status in (AbortStatus.before_start, AbortStatus.confirmed)
+
+
+@dataclass
+class AbortOutcome:
+    """
+    Record, stored by the worker, describing the abort that actually interrupted a job.
+    """
+
+    request_id: str
+    reason: Optional[str]
+    phase: str
+
+
 @dataclass
 class JobDef:
     function: str
@@ -61,6 +120,12 @@ class JobResult(JobDef):
     start_time: datetime
     finish_time: datetime
     queue_name: str
+    #: phase in which the job was aborted ('before_start' or 'running'), None if it was not aborted
+    abort_phase: Optional[str] = None
+    #: id of the abort request which actually interrupted the job, if any
+    abort_request_id: Optional[str] = None
+    #: reason attached to the abort request which actually interrupted the job, if any
+    abort_reason: Optional[str] = None
 
 
 class Job:
@@ -168,15 +233,51 @@ class Job:
         else:
             return JobStatus.not_found
 
-    async def abort(self, *, timeout: Optional[float] = None, poll_delay: float = 0.5) -> bool:
+    async def abort(
+        self,
+        *,
+        request_id: Optional[str] = None,
+        reason: Optional[str] = None,
+        timeout: Optional[float] = None,
+        poll_delay: float = 0.5,
+    ) -> AbortResult:
         """
-        Abort the job.
+        Request abortion of the job.
 
-        :param timeout: maximum time to wait for the job result before raising ``TimeoutError``,
-            will wait forever on None
-        :param poll_delay: how often to poll redis for the job result
-        :return: True if the job aborted properly, False otherwise
+        Several abort requests can be issued concurrently: the first one that actually interrupts the job
+        wins, later requests never overwrite a stored result or the effective abort reason.
+
+        :param request_id: identifier of the abort request, a random hex id is generated when None;
+            can be used to deduplicate requests
+        :param reason: human readable reason for the abort, this is passed to the ``on_job_end`` /
+            ``after_job_end`` hooks but never becomes the job's business result
+        :param timeout: maximum time to wait for the abort to be confirmed by a worker,
+            waits forever on None; on timeout an :class:`AbortResult` with
+            :attr:`AbortStatus.timeout` is returned
+        :param poll_delay: how often to poll redis for the abort outcome
+        :return: an :class:`AbortResult` receipt describing what happened
         """
+        if request_id is None:
+            request_id = uuid4().hex
+
+        # if the job has already finished (result or abort outcome present, job gone), do nothing:
+        # this abort must never overwrite the completed result
+        current_status = await self.status()
+        if current_status in (JobStatus.complete, JobStatus.not_found):
+            outcome = await self._get_abort_outcome() if current_status is JobStatus.complete else None
+            if outcome is not None:
+                return AbortResult(
+                    request_id=request_id,
+                    reason=reason,
+                    status=AbortStatus.confirmed
+                    if outcome.phase == 'running'
+                    else AbortStatus.before_start,
+                    effective_request_id=outcome.request_id,
+                    effective_reason=outcome.reason,
+                )
+            # already finished, or nothing ever existed for this id: nothing to abort and no marker
+            return AbortResult(request_id=request_id, reason=reason, status=AbortStatus.already_finished)
+
         job_info = await self.info()
         if job_info and job_info.score and job_info.score > timestamp_ms():
             async with self._redis.pipeline(transaction=True) as tr:
@@ -184,17 +285,51 @@ class Job:
                 tr.zadd(self._queue_name, {self.job_id: 1})
                 await tr.execute()
 
-        await self._redis.zadd(abort_jobs_ss, {self.job_id: timestamp_ms()})
+        # NX on the abort request keeps the first request's id and reason; both point to the same
+        # outcome, but only the first request is actually effective
+        request_blob = serialize_abort_request(request_id, reason)
+        async with self._redis.pipeline(transaction=True) as tr:
+            tr.zadd(abort_jobs_ss, {self.job_id: timestamp_ms()})
+            tr.set(abort_request_key_prefix + self.job_id, request_blob, nx=True)
+            await tr.execute()
 
-        try:
-            await self.result(timeout=timeout, poll_delay=poll_delay)
-        except asyncio.CancelledError:
-            return True
-        except ResultNotFound:
-            # We do not know if the job was cancelled or not
-            return False
-        else:
-            return False
+        # poll both the result key and the abort outcome key: an abort before start may leave no
+        # result (keep_result=0) while still writing an outcome
+        async for delay in poll(poll_delay):
+            async with self._redis.pipeline(transaction=True) as tr:
+                tr.get(abort_outcome_key_prefix + self.job_id)
+                tr.get(result_key_prefix + self.job_id)
+                tr.zscore(self._queue_name, self.job_id)
+                tr.exists(in_progress_key_prefix + self.job_id)
+                outcome_v, result_v, queue_score, in_progress = await tr.execute()
+
+            if outcome_v:
+                outcome = deserialize_abort_outcome(outcome_v)
+                return AbortResult(
+                    request_id=request_id,
+                    reason=reason,
+                    status=AbortStatus.confirmed
+                    if outcome.phase == 'running'
+                    else AbortStatus.before_start,
+                    effective_request_id=outcome.request_id,
+                    effective_reason=outcome.reason,
+                )
+            if result_v:
+                # job finished with a stored result that carries no abort outcome: the abort never
+                # took effect (normal success or failure), never claim it as cancelled
+                return AbortResult(request_id=request_id, reason=reason, status=AbortStatus.already_finished)
+            if queue_score is None and not in_progress:
+                # nothing left in the queue and no result/outcome: we cannot tell what happened
+                return AbortResult(request_id=request_id, reason=reason, status=AbortStatus.already_finished)
+
+            if timeout is not None and delay > timeout:
+                return AbortResult(request_id=request_id, reason=reason, status=AbortStatus.timeout)
+
+    async def _get_abort_outcome(self) -> Optional[AbortOutcome]:
+        v = await self._redis.get(abort_outcome_key_prefix + self.job_id)
+        if v:
+            return deserialize_abort_outcome(v)
+        return None
 
     def __repr__(self) -> str:
         return f'<arq job {self.job_id}>'
@@ -239,6 +374,9 @@ def serialize_result(
     ref: str,
     queue_name: str,
     job_id: str,
+    abort_phase: Optional[str] = None,
+    abort_request_id: Optional[str] = None,
+    abort_reason: Optional[str] = None,
     *,
     serializer: Optional[Serializer] = None,
 ) -> Optional[bytes]:
@@ -255,6 +393,12 @@ def serialize_result(
         'q': queue_name,
         'id': job_id,
     }
+    if abort_phase is not None:
+        data['ap'] = abort_phase
+    if abort_request_id is not None:
+        data['arid'] = abort_request_id
+    if abort_reason is not None:
+        data['arr'] = abort_reason
     if serializer is None:
         serializer = pickle.dumps
     try:
@@ -319,6 +463,33 @@ def deserialize_result(r: bytes, *, deserializer: Optional[Deserializer] = None)
             finish_time=ms_to_datetime(d['ft']),
             queue_name=d.get('q', '<unknown>'),
             job_id=d.get('id', '<unknown>'),
+            abort_phase=d.get('ap'),
+            abort_request_id=d.get('arid'),
+            abort_reason=d.get('arr'),
         )
     except Exception as e:
         raise DeserializationError('unable to deserialize job result') from e
+
+
+def serialize_abort_request(request_id: str, reason: Optional[str]) -> bytes:
+    return pickle.dumps({'id': request_id, 'r': reason})
+
+
+def deserialize_abort_request(r: bytes) -> tuple[str, Optional[str]]:
+    try:
+        d = pickle.loads(r)
+        return d['id'], d.get('r')
+    except Exception as e:
+        raise DeserializationError('unable to deserialize abort request') from e
+
+
+def serialize_abort_outcome(request_id: str, reason: Optional[str], phase: str) -> bytes:
+    return pickle.dumps({'id': request_id, 'r': reason, 'p': phase})
+
+
+def deserialize_abort_outcome(r: bytes) -> AbortOutcome:
+    try:
+        d = pickle.loads(r)
+        return AbortOutcome(request_id=d['id'], reason=d.get('r'), phase=d['p'])
+    except Exception as e:
+        raise DeserializationError('unable to deserialize abort outcome') from e
