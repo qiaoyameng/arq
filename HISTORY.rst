@@ -3,6 +3,15 @@
 History
 -------
 
+unreleased
+..........
+
+* Add optional ``_serial_group`` argument to ``ArqRedis.enqueue_job``: jobs sharing a serial group
+  name run one at a time, in enqueue order, while different groups (and jobs without one) keep
+  running in parallel. A job only starts when it is both the head of its group and the holder of
+  the expiring group lock, so failure, cancellation, retry or a disappearing worker can neither run
+  two members together nor wedge the group forever.
+
 v0.28.0 (2026-04-16)
 ....................
 

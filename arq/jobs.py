@@ -48,6 +48,7 @@ class JobDef:
     enqueue_time: datetime
     score: Optional[int]
     job_id: Optional[str]
+    serial_group: Optional[str]
 
     def __post_init__(self) -> None:
         if isinstance(self.score, float):
@@ -214,10 +215,18 @@ def serialize_job(
     kwargs: dict[str, Any],
     job_try: Optional[int],
     enqueue_time_ms: int,
+    serial_group: Optional[str] = None,
     *,
     serializer: Optional[Serializer] = None,
 ) -> bytes:
-    data = {'t': job_try, 'f': function_name, 'a': args, 'k': kwargs, 'et': enqueue_time_ms}
+    data = {
+        't': job_try,
+        'f': function_name,
+        'a': args,
+        'k': kwargs,
+        'et': enqueue_time_ms,
+        'g': serial_group,
+    }
     if serializer is None:
         serializer = pickle.dumps
     try:
@@ -239,6 +248,7 @@ def serialize_result(
     ref: str,
     queue_name: str,
     job_id: str,
+    serial_group: Optional[str] = None,
     *,
     serializer: Optional[Serializer] = None,
 ) -> Optional[bytes]:
@@ -254,6 +264,7 @@ def serialize_result(
         'ft': finished_ms,
         'q': queue_name,
         'id': job_id,
+        'g': serial_group,
     }
     if serializer is None:
         serializer = pickle.dumps
@@ -284,6 +295,7 @@ def deserialize_job(r: bytes, *, deserializer: Optional[Deserializer] = None) ->
             enqueue_time=ms_to_datetime(d['et']),
             score=None,
             job_id=None,
+            serial_group=d.get('g'),
         )
     except Exception as e:
         raise DeserializationError('unable to deserialize job') from e
@@ -296,7 +308,7 @@ def deserialize_job_raw(
         deserializer = pickle.loads
     try:
         d = deserializer(r)
-        return d['f'], d['a'], d['k'], d['t'], d['et']
+        return d['f'], d['a'], d['k'], d['t'], d['et'], d.get('g')
     except Exception as e:
         raise DeserializationError('unable to deserialize job') from e
 
@@ -319,6 +331,7 @@ def deserialize_result(r: bytes, *, deserializer: Optional[Deserializer] = None)
             finish_time=ms_to_datetime(d['ft']),
             queue_name=d.get('q', '<unknown>'),
             job_id=d.get('id', '<unknown>'),
+            serial_group=d.get('g'),
         )
     except Exception as e:
         raise DeserializationError('unable to deserialize job result') from e

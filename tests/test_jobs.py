@@ -90,6 +90,7 @@ async def test_enqueue_job(arq_redis: ArqRedis, worker, queue_name=default_queue
         score=None,
         queue_name=expected_queue_name,
         job_id=IsStr(),
+        serial_group=None,
     )
     results = await arq_redis.all_job_results()
     assert results == [
@@ -106,6 +107,7 @@ async def test_enqueue_job(arq_redis: ArqRedis, worker, queue_name=default_queue
             score=None,
             queue_name=expected_queue_name,
             job_id=j.job_id,
+            serial_group=None,
         )
     ]
 
@@ -204,7 +206,14 @@ async def test_deserialize_info(arq_redis: ArqRedis):
 
 
 async def test_deserialize_job_raw():
-    assert deserialize_job_raw(pickle.dumps({'f': 1, 'a': 2, 'k': 3, 't': 4, 'et': 5})) == (1, 2, 3, 4, 5)
+    assert deserialize_job_raw(pickle.dumps({'f': 1, 'a': 2, 'k': 3, 't': 4, 'et': 5})) == (
+        1,
+        2,
+        3,
+        4,
+        5,
+        None,
+    )
     with pytest.raises(DeserializationError, match='unable to deserialize job'):
         deserialize_job_raw(b'123')
 

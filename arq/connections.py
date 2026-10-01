@@ -13,7 +13,14 @@ from redis.asyncio.retry import Retry
 from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import RedisError, WatchError
 
-from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
+from .constants import (
+    default_queue_name,
+    expires_extra_ms,
+    job_key_prefix,
+    result_key_prefix,
+    serial_group_key_prefix,
+    serial_group_member_key_prefix,
+)
 from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
 from .utils import timestamp_ms, to_ms, to_unix_ms
 
@@ -126,6 +133,7 @@ class ArqRedis(BaseRedis):
         _defer_by: Union[None, int, float, timedelta] = None,
         _expires: Union[None, int, float, timedelta] = None,
         _job_try: Optional[int] = None,
+        _serial_group: Optional[str] = None,
         **kwargs: Any,
     ) -> Optional[Job]:
         """
@@ -140,6 +148,12 @@ class ArqRedis(BaseRedis):
         :param _expires: do not start or retry a job after this duration;
             defaults to 24 hours plus deferring time, if any
         :param _job_try: useful when re-enqueueing jobs within a job
+        :param _serial_group: optional serial group name; jobs sharing a name run one at a time,
+            in enqueue order, while different groups (and jobs without a group) run in parallel.
+            Within a group a job only becomes eligible once it reaches the head of the group
+            (all earlier members have terminated); if the head is deferred until a future time,
+            the rest of the group waits behind it. A worker dying while holding a group does not
+            block the group forever: its lock expires and another worker re-runs the head.
         :param kwargs: any keyword arguments to pass to the function
         :return: :class:`arq.jobs.Job` instance or ``None`` if a job with this ID already exists
         """
@@ -169,10 +183,25 @@ class ArqRedis(BaseRedis):
 
             expires_ms = expires_ms or score - enqueue_time_ms + self.expires_extra_ms
 
-            job = serialize_job(function, args, kwargs, _job_try, enqueue_time_ms, serializer=self.job_serializer)
+            job = serialize_job(
+                function,
+                args,
+                kwargs,
+                _job_try,
+                enqueue_time_ms,
+                _serial_group,
+                serializer=self.job_serializer,
+            )
             pipe.multi()
             pipe.psetex(job_key, expires_ms, job)
             pipe.zadd(_queue_name, {job_id: score})
+            if _serial_group:
+                # list of member job ids in enqueue order; only the head can ever run
+                group_key = f'{serial_group_key_prefix}{_queue_name}:{_serial_group}'
+                group_member_key = f'{serial_group_member_key_prefix}{job_id}'
+                pipe.rpush(group_key, job_id)
+                pipe.pexpire(group_key, expires_ms)
+                pipe.psetex(group_member_key, expires_ms, _serial_group.encode())
             try:
                 await pipe.execute()
             except WatchError:

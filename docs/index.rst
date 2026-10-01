@@ -143,6 +143,30 @@ that a job with a particular ID cannot be enqueued again until its execution has
 The check of ``job_id`` uniqueness in the queue is performed using a redis transaction so you can be certain jobs
 with the same id won't be enqueued twice (or overwritten) even if they're enqueued at exactly the same time.
 
+Serial groups
+.............
+
+Sometimes a set of jobs must execute one at a time, strictly in the order they were enqueued, while other
+jobs continue to run in parallel — for example jobs belonging to the same account.
+
+Enqueue such jobs with the optional ``_serial_group`` argument, see
+:func:`arq.connections.ArqRedis.enqueue_job`. A job only starts once it is the *head* of its group (all earlier
+members have terminated) **and** it has acquired the group's execution lock. Jobs with different group names
+(or no group at all) still run concurrently up to the worker's ``max_jobs``, so there is no need — and no reason —
+to reduce ``max_jobs`` globally.
+
+.. literalinclude:: examples/serial_groups.py
+
+Ordering rules:
+
+* members run in enqueue (RPUSH) order within their queue and group;
+* if the head is deferred (``_defer_until`` / ``_defer_by``) or is re-enqueued in the future by a
+  :class:`arq.worker.Retry`, the members behind it wait — the whole group advances in order;
+* a retry keeps the job at the head until the retry runs; permanent failure and cancellation remove it so the
+  next member can start;
+* the group lock is a short lived key: if a worker disappears while holding it, the lock (like the per-job
+  ``in-progress`` marker) expires and another worker re-runs the head, so the group can never get stuck forever.
+
 Job Results
 ...........
 

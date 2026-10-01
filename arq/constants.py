@@ -3,6 +3,10 @@ job_key_prefix = 'arq:job:'
 in_progress_key_prefix = 'arq:in-progress:'
 result_key_prefix = 'arq:result:'
 retry_key_prefix = 'arq:retry:'
+# serial groups, see ``ArqRedis.enqueue_job``'s ``_serial_group`` argument
+serial_group_key_prefix = 'arq:serial-group:'
+serial_group_member_key_prefix = 'arq:serial-group-member:'
+serial_group_lock_key_prefix = 'arq:serial-group-lock:'
 abort_jobs_ss = 'arq:abort'
 # age of items in the abort_key sorted set after which they're deleted
 abort_job_max_age = 60

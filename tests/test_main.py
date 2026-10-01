@@ -257,6 +257,7 @@ async def test_get_jobs(arq_redis: ArqRedis):
             'enqueue_time': IsNow(tz='UTC'),
             'score': IsInt(),
             'job_id': '1',
+            'serial_group': None,
         },
         {
             'function': 'second',
@@ -266,6 +267,7 @@ async def test_get_jobs(arq_redis: ArqRedis):
             'enqueue_time': IsNow(tz='UTC'),
             'score': IsInt(),
             'job_id': '2',
+            'serial_group': None,
         },
         {
             'function': 'third',
@@ -275,6 +277,7 @@ async def test_get_jobs(arq_redis: ArqRedis):
             'enqueue_time': IsNow(tz='UTC'),
             'score': IsInt(),
             'job_id': '3',
+            'serial_group': None,
         },
     ]
     assert jobs[0].score < jobs[1].score < jobs[2].score
