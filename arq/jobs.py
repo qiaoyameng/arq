@@ -48,6 +48,7 @@ class JobDef:
     enqueue_time: datetime
     score: Optional[int]
     job_id: Optional[str]
+    serial_group: Optional[str] = None
 
     def __post_init__(self) -> None:
         if isinstance(self.score, float):
@@ -56,11 +57,12 @@ class JobDef:
 
 @dataclass
 class JobResult(JobDef):
-    success: bool
-    result: Any
-    start_time: datetime
-    finish_time: datetime
-    queue_name: str
+    # defaulted so they can follow the defaulted ``serial_group`` field inherited from ``JobDef``
+    success: bool = False
+    result: Any = None
+    start_time: Optional[datetime] = None
+    finish_time: Optional[datetime] = None
+    queue_name: Optional[str] = None
 
 
 class Job:
@@ -214,10 +216,13 @@ def serialize_job(
     kwargs: dict[str, Any],
     job_try: Optional[int],
     enqueue_time_ms: int,
+    serial_group: Optional[str] = None,
     *,
     serializer: Optional[Serializer] = None,
 ) -> bytes:
     data = {'t': job_try, 'f': function_name, 'a': args, 'k': kwargs, 'et': enqueue_time_ms}
+    if serial_group is not None:
+        data['sg'] = serial_group
     if serializer is None:
         serializer = pickle.dumps
     try:
@@ -232,6 +237,7 @@ def serialize_result(
     kwargs: dict[str, Any],
     job_try: int,
     enqueue_time_ms: int,
+    serial_group: Optional[str],
     success: bool,
     result: Any,
     start_ms: int,
@@ -255,6 +261,8 @@ def serialize_result(
         'q': queue_name,
         'id': job_id,
     }
+    if serial_group is not None:
+        data['sg'] = serial_group
     if serializer is None:
         serializer = pickle.dumps
     try:
@@ -284,6 +292,7 @@ def deserialize_job(r: bytes, *, deserializer: Optional[Deserializer] = None) ->
             enqueue_time=ms_to_datetime(d['et']),
             score=None,
             job_id=None,
+            serial_group=d.get('sg'),
         )
     except Exception as e:
         raise DeserializationError('unable to deserialize job') from e
@@ -291,12 +300,12 @@ def deserialize_job(r: bytes, *, deserializer: Optional[Deserializer] = None) ->
 
 def deserialize_job_raw(
     r: bytes, *, deserializer: Optional[Deserializer] = None
-) -> tuple[str, tuple[Any, ...], dict[str, Any], int, int]:
+) -> tuple[str, tuple[Any, ...], dict[str, Any], int, int, Optional[str]]:
     if deserializer is None:
         deserializer = pickle.loads
     try:
         d = deserializer(r)
-        return d['f'], d['a'], d['k'], d['t'], d['et']
+        return d['f'], d['a'], d['k'], d['t'], d['et'], d.get('sg')
     except Exception as e:
         raise DeserializationError('unable to deserialize job') from e
 
@@ -319,6 +328,7 @@ def deserialize_result(r: bytes, *, deserializer: Optional[Deserializer] = None)
             finish_time=ms_to_datetime(d['ft']),
             queue_name=d.get('q', '<unknown>'),
             job_id=d.get('id', '<unknown>'),
+            serial_group=d.get('sg'),
         )
     except Exception as e:
         raise DeserializationError('unable to deserialize job result') from e

@@ -204,7 +204,12 @@ async def test_deserialize_info(arq_redis: ArqRedis):
 
 
 async def test_deserialize_job_raw():
-    assert deserialize_job_raw(pickle.dumps({'f': 1, 'a': 2, 'k': 3, 't': 4, 'et': 5})) == (1, 2, 3, 4, 5)
+    assert deserialize_job_raw(pickle.dumps({'f': 1, 'a': 2, 'k': 3, 't': 4, 'et': 5})) == (
+        1, 2, 3, 4, 5, None
+    )
+    assert deserialize_job_raw(pickle.dumps({'f': 1, 'a': 2, 'k': 3, 't': 4, 'et': 5, 'sg': 'g1'})) == (
+        1, 2, 3, 4, 5, 'g1'
+    )
     with pytest.raises(DeserializationError, match='unable to deserialize job'):
         deserialize_job_raw(b'123')
 

@@ -13,11 +13,26 @@ from redis.asyncio.retry import Retry
 from redis.asyncio.sentinel import Sentinel
 from redis.exceptions import RedisError, WatchError
 
-from .constants import default_queue_name, expires_extra_ms, job_key_prefix, result_key_prefix
+from .constants import (
+    default_queue_name,
+    expires_extra_ms,
+    job_key_prefix,
+    result_key_prefix,
+    serial_group_key_prefix,
+    serial_seq_key_suffix,
+)
 from .jobs import Deserializer, Job, JobDef, JobResult, Serializer, deserialize_job, serialize_job
 from .utils import timestamp_ms, to_ms, to_unix_ms
 
 logger = logging.getLogger('arq.connections')
+
+
+def serial_group_key(queue_name: str, serial_group: str) -> str:
+    return f'{serial_group_key_prefix}{queue_name}:{serial_group}'
+
+
+def serial_group_seq_key(group_key: str) -> str:
+    return group_key + serial_seq_key_suffix
 
 
 @dataclass
@@ -126,6 +141,7 @@ class ArqRedis(BaseRedis):
         _defer_by: Union[None, int, float, timedelta] = None,
         _expires: Union[None, int, float, timedelta] = None,
         _job_try: Optional[int] = None,
+        _serial_group: Optional[str] = None,
         **kwargs: Any,
     ) -> Optional[Job]:
         """
@@ -140,6 +156,9 @@ class ArqRedis(BaseRedis):
         :param _expires: do not start or retry a job after this duration;
             defaults to 24 hours plus deferring time, if any
         :param _job_try: useful when re-enqueueing jobs within a job
+        :param _serial_group: name of the serial group this job belongs to; jobs sharing the same
+            serial group run one at a time in enqueue order, while jobs in different groups (or
+            jobs without a serial group) can run in parallel
         :param kwargs: any keyword arguments to pass to the function
         :return: :class:`arq.jobs.Job` instance or ``None`` if a job with this ID already exists
         """
@@ -149,6 +168,8 @@ class ArqRedis(BaseRedis):
         job_key = job_key_prefix + job_id
         if _defer_until and _defer_by:
             raise RuntimeError("use either 'defer_until' or 'defer_by' or neither, not both")
+        if _serial_group is not None and not isinstance(_serial_group, str):
+            raise TypeError("_serial_group must be a string or None")
 
         defer_by_ms = to_ms(_defer_by)
         expires_ms = to_ms(_expires)
@@ -169,10 +190,25 @@ class ArqRedis(BaseRedis):
 
             expires_ms = expires_ms or score - enqueue_time_ms + self.expires_extra_ms
 
-            job = serialize_job(function, args, kwargs, _job_try, enqueue_time_ms, serializer=self.job_serializer)
+            group_key = serial_group_key(_queue_name, _serial_group) if _serial_group is not None else None
+            group_seq = None
+            if group_key is not None:
+                group_seq = await self.incr(serial_group_seq_key(group_key))
+
+            job = serialize_job(
+                function,
+                args,
+                kwargs,
+                _job_try,
+                enqueue_time_ms,
+                _serial_group,
+                serializer=self.job_serializer,
+            )
             pipe.multi()
             pipe.psetex(job_key, expires_ms, job)
             pipe.zadd(_queue_name, {job_id: score})
+            if group_key is not None:
+                pipe.zadd(group_key, {job_id: group_seq})
             try:
                 await pipe.execute()
             except WatchError:

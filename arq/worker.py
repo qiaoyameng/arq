@@ -10,13 +10,22 @@ from functools import partial
 from signal import Signals
 from time import time
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union, cast
+from uuid import uuid4
 
 from redis.exceptions import ResponseError, WatchError
 
 from arq.cron import CronJob
-from arq.jobs import Deserializer, JobResult, SerializationError, Serializer, deserialize_job_raw, serialize_result
+from arq.jobs import (
+    Deserializer,
+    JobResult,
+    SerializationError,
+    Serializer,
+    deserialize_job,
+    deserialize_job_raw,
+    serialize_result,
+)
 
-from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info
+from .connections import ArqRedis, RedisSettings, create_pool, log_redis_info, serial_group_key
 from .constants import (
     abort_job_max_age,
     abort_jobs_ss,
@@ -28,6 +37,7 @@ from .constants import (
     keep_cronjob_progress,
     result_key_prefix,
     retry_key_prefix,
+    serial_lock_key_suffix,
 )
 from .utils import (
     args_to_string,
@@ -444,38 +454,92 @@ class Worker:
                 self.sem.release()
                 return None
 
-            self.job_counter = self.job_counter + 1
-
             job_id = job_id_b.decode()
             in_progress_key = in_progress_key_prefix + job_id
+            now = timestamp_ms()
+
+            job_def = None
+            serial_group: Optional[str] = None
+            group_key: Optional[str] = None
+            lock_key: Optional[str] = None
+            lock_token: Optional[str] = None
+
+            def release_slot() -> None:
+                self.sem.release()
+
             async with self.pool.pipeline(transaction=True) as pipe:
                 await pipe.watch(in_progress_key)
                 ongoing_exists = await pipe.exists(in_progress_key)
                 score = await pipe.zscore(self.queue_name, job_id)
-                if ongoing_exists or not score or score > timestamp_ms():
+                if not ongoing_exists and score and score <= now:
+                    raw_job = await pipe.get(job_key_prefix + job_id)
+                    if raw_job:
+                        try:
+                            job_def = deserialize_job(raw_job, deserializer=self.job_deserializer)
+                        except SerializationError:
+                            job_def = None
+                        serial_group = job_def.serial_group if job_def is not None else None
+                if serial_group is not None:
+                    group_key = serial_group_key(self.queue_name, serial_group)
+                    lock_key = group_key + serial_lock_key_suffix
+                    await pipe.watch(lock_key)
+                    await pipe.watch(group_key)
+                    group_members = await pipe.zrange(group_key, start=0, end=0)
+                    lock_held = await pipe.exists(lock_key)
+                else:
+                    group_members = [job_id_b]
+                    lock_held = False
+
+                if (
+                    ongoing_exists
+                    or not score
+                    or score > now
+                    or group_members[:1] != [job_id_b]
+                    or lock_held
+                ):
                     # job already started elsewhere, or already finished and removed from queue
                     # if score > ts_now,
                     # it means probably the job was re-enqueued with a delay in another worker
-                    self.job_counter = self.job_counter - 1
-                    self.sem.release()
-                    logger.debug('job %s already running elsewhere', job_id)
+                    await pipe.reset()
+                    if serial_group is not None and not ongoing_exists:
+                        logger.debug('job %s waiting for serial group %r', job_id, serial_group)
+                    else:
+                        logger.debug('job %s already running elsewhere', job_id)
+                    release_slot()
                     continue
 
+                self.job_counter += 1
+                lock_token = uuid4().hex if serial_group is not None else None
                 pipe.multi()
                 pipe.psetex(in_progress_key, int(self.in_progress_timeout_s * 1000), b'1')
+                if lock_key is not None and lock_token is not None:
+                    pipe.set(
+                        lock_key,
+                        lock_token,
+                        px=int(self.in_progress_timeout_s * 1000),
+                    )
                 try:
                     await pipe.execute()
                 except (ResponseError, WatchError):
                     # job already started elsewhere since we got 'existing'
-                    self.job_counter = self.job_counter - 1
-                    self.sem.release()
+                    self.job_counter -= 1
+                    release_slot()
                     logger.debug('multi-exec error, job %s already started elsewhere', job_id)
                 else:
-                    t = self.loop.create_task(self.run_job(job_id, int(score)))
+                    t = self.loop.create_task(
+                        self.run_job(job_id, int(score), serial_group=serial_group, serial_lock_token=lock_token)
+                    )
                     t.add_done_callback(lambda _: self._release_sem_dec_counter_on_complete())
                     self.tasks[job_id] = t
 
-    async def run_job(self, job_id: str, score: int) -> None:  # noqa: C901
+    async def run_job(
+        self,
+        job_id: str,
+        score: int,
+        *,
+        serial_group: Optional[str] = None,
+        serial_lock_token: Optional[str] = None,
+    ) -> None:  # noqa: C901
         start_ms = timestamp_ms()
         async with self.pool.pipeline(transaction=True) as pipe:
             pipe.get(job_key_prefix + job_id)
@@ -500,6 +564,7 @@ class Worker:
                 kwargs=kwargs,
                 job_try=job_try,
                 enqueue_time_ms=enqueue_time_ms,
+                serial_group=serial_group,
                 success=False,
                 result=exc,
                 start_ms=start_ms,
@@ -509,16 +574,25 @@ class Worker:
                 queue_name=self.queue_name,
                 job_id=job_id,
             )
-            await asyncio.shield(self.finish_failed_job(job_id, result_data_))
+            await asyncio.shield(
+                self.finish_failed_job(job_id, result_data_, serial_group, serial_lock_token)
+            )
 
         if not v:
             logger.warning('job %s expired', job_id)
             return await job_failed(JobExecutionFailed('job expired'))
 
         try:
-            function_name, args, kwargs, enqueue_job_try, enqueue_time_ms = deserialize_job_raw(
-                v, deserializer=self.job_deserializer
-            )
+            (
+                function_name,
+                args,
+                kwargs,
+                enqueue_job_try,
+                enqueue_time_ms,
+                payload_serial_group,
+            ) = deserialize_job_raw(v, deserializer=self.job_deserializer)
+            if payload_serial_group is not None:
+                serial_group = payload_serial_group
         except SerializationError as e:
             logger.exception('deserializing job %s failed', job_id)
             return await job_failed(e)
@@ -552,21 +626,24 @@ class Worker:
             logger.warning('%6.2fs ! %s max retries %d exceeded', t, ref, max_tries)
             self.jobs_failed += 1
             result_data = serialize_result(
-                function_name,
-                args,
-                kwargs,
-                job_try,
-                enqueue_time_ms,
-                False,
-                JobExecutionFailed(f'max {max_tries} retries exceeded'),
-                start_ms,
-                timestamp_ms(),
-                ref,
-                self.queue_name,
+                function=function_name,
+                args=args,
+                kwargs=kwargs,
+                job_try=job_try,
+                enqueue_time_ms=enqueue_time_ms,
+                serial_group=serial_group,
+                success=False,
+                result=JobExecutionFailed(f'max {max_tries} retries exceeded'),
+                start_ms=start_ms,
+                finished_ms=timestamp_ms(),
+                ref=ref,
+                queue_name=self.queue_name,
                 job_id=job_id,
                 serializer=self.job_serializer,
             )
-            return await asyncio.shield(self.finish_failed_job(job_id, result_data))
+            return await asyncio.shield(
+                self.finish_failed_job(job_id, result_data, serial_group, serial_lock_token)
+            )
 
         result = no_result
         exc_extra = None
@@ -620,7 +697,7 @@ class Worker:
                 logger.info('%6.2fs ⊘ %s aborted', t, ref)
                 result = e
                 finish = True
-                self.aborting_tasks.remove(job_id)
+                self.aborting_tasks.discard(job_id)
                 self.jobs_failed += 1
             elif self.retry_jobs and isinstance(e, (asyncio.CancelledError, RetryJob)):
                 logger.info('%6.2fs ↻ %s cancelled, will be run again', t, ref)
@@ -651,6 +728,7 @@ class Worker:
                 kwargs,
                 job_try,
                 enqueue_time_ms,
+                serial_group,
                 success,
                 result,
                 start_ms,
@@ -673,6 +751,8 @@ class Worker:
                 keep_result_forever,
                 incr_score,
                 keep_in_progress,
+                serial_group,
+                serial_lock_token,
             )
         )
 
@@ -688,6 +768,8 @@ class Worker:
         keep_result_forever: bool,
         incr_score: Optional[int],
         keep_in_progress: Optional[float],
+        serial_group: Optional[str] = None,
+        serial_lock_token: Optional[str] = None,
     ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             delete_keys = []
@@ -704,13 +786,54 @@ class Worker:
                 delete_keys += [retry_key_prefix + job_id, job_key_prefix + job_id]
                 tr.zrem(abort_jobs_ss, job_id)
                 tr.zrem(self.queue_name, job_id)
+                if serial_group is not None:
+                    group_key = serial_group_key(self.queue_name, serial_group)
+                    tr.zrem(group_key, job_id)
             elif incr_score:
                 tr.zincrby(self.queue_name, incr_score, job_id)
             if delete_keys:
                 tr.delete(*delete_keys)
             await tr.execute()
 
-    async def finish_failed_job(self, job_id: str, result_data: Optional[bytes]) -> None:
+        if serial_group is not None:
+            await self._release_serial_lock(serial_group, serial_lock_token)
+
+    async def _release_serial_lock(self, serial_group: str, lock_token: Optional[str]) -> None:
+        """
+        Release a serial group lock, but only if it still holds the token acquired for this run.
+
+        The token check matters once the lock TTL expired while the job was still running:
+        another worker may then legitimately hold a fresh lock, which must not be deleted here.
+        """
+        group_key = serial_group_key(self.queue_name, serial_group)
+        lock_key = group_key + serial_lock_key_suffix
+        if lock_token is None:
+            await self.pool.delete(lock_key)
+            return
+        async with self.pool.pipeline(transaction=True) as pipe:
+            await pipe.watch(lock_key)
+            current = await pipe.get(lock_key)
+            if current is None:
+                await pipe.reset()
+                return
+            if isinstance(current, bytes):
+                current = current.decode()
+            pipe.multi()
+            if current == lock_token:
+                pipe.delete(lock_key)
+            try:
+                await pipe.execute()
+            except WatchError:
+                # lock changed concurrently; whoever owns it now is responsible for releasing it
+                pass
+
+    async def finish_failed_job(
+        self,
+        job_id: str,
+        result_data: Optional[bytes],
+        serial_group: Optional[str] = None,
+        serial_lock_token: Optional[str] = None,
+    ) -> None:
         async with self.pool.pipeline(transaction=True) as tr:
             tr.delete(
                 retry_key_prefix + job_id,
@@ -719,12 +842,18 @@ class Worker:
             )
             tr.zrem(abort_jobs_ss, job_id)
             tr.zrem(self.queue_name, job_id)
+            if serial_group is not None:
+                group_key = serial_group_key(self.queue_name, serial_group)
+                tr.zrem(group_key, job_id)
             # result_data would only be None if serializing the result fails
             keep_result = self.keep_result_forever or self.keep_result_s > 0
             if result_data is not None and keep_result:  # pragma: no branch
                 expire = 0 if self.keep_result_forever else self.keep_result_s
                 tr.set(result_key_prefix + job_id, result_data, px=to_ms(expire))
             await tr.execute()
+
+        if serial_group is not None:
+            await self._release_serial_lock(serial_group, serial_lock_token)
 
     async def heart_beat(self) -> None:
         now = datetime.now(tz=self.timezone)

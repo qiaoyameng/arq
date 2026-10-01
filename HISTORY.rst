@@ -3,6 +3,12 @@
 History
 -------
 
+unreleased
+..........
+
+* Add optional ``_serial_group`` argument to ``enqueue_job``: jobs sharing a group run one at a time in enqueue
+  order while different groups still run in parallel, with TTL-based recovery when a worker disappears
+
 v0.28.0 (2026-04-16)
 ....................
 

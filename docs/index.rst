@@ -143,6 +143,38 @@ that a job with a particular ID cannot be enqueued again until its execution has
 The check of ``job_id`` uniqueness in the queue is performed using a redis transaction so you can be certain jobs
 with the same id won't be enqueued twice (or overwritten) even if they're enqueued at exactly the same time.
 
+Serial Groups
+.............
+
+Sometimes jobs that touch the same resource (eg. jobs for the same user account) must run in the order they were
+enqueued, while jobs for different resources should still run in parallel. Lowering the worker's ``max_jobs`` to
+``1`` would serialise *every* job and throw that parallelism away.
+
+*arq* supports this via the optional ``_serial_group`` argument to
+:func:`arq.connections.ArqRedis.enqueue_job`. Jobs sharing a serial group:
+
+* run **one at a time** and **in enqueue order** — a job only starts once it is both the head of its group and
+  the holder of a group lock;
+* never start twice concurrently, even with several workers polling the same queue (the head/lock check is a
+  single redis transaction);
+* do not block jobs belonging to other groups, or jobs without a serial group.
+
+Ordering with deferred jobs is defined as follows: a job's position in its group is fixed at enqueue time, so a
+deferred head (``_defer_until`` / ``_defer_by``, or a :class:`arq.worker.Retry` raised with ``defer``) keeps its
+position; followers stay blocked behind it until the head becomes due, finishes, fails permanently or is aborted.
+
+The group lock is taken with a TTL (the worker's maximum job timeout plus ten seconds, matching the
+``in-progress`` key lifetime). If a worker process disappears while holding it, the lock and ``in-progress``
+marker expire automatically and another worker redelivers the head, so the group cannot stall forever. On
+success, permanent failure, exhaustion of retries or abort the member is removed and the lock released; a
+deferred retry keeps the member in place so the head is preserved.
+
+.. code-block:: python
+
+    # jobs for account 42 run strictly in order; accounts 42 and 43 run concurrently
+    await redis.enqueue_job('sync_account', 42, _serial_group='account:42')
+    await redis.enqueue_job('sync_account', 43, _serial_group='account:43')
+
 Job Results
 ...........
 
